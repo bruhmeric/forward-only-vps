@@ -59,7 +59,22 @@ async def post_init(app: Application) -> None:
 
     cfg: Config = app.bot_data["config"]
     user_session: UserSession | None = None
-    if cfg.has_user_session:
+
+    # Debug: log what credentials we have (without revealing secrets)
+    logger.info("Config check: API_ID=%s, API_HASH=%s, SESSION_STRING=%s",
+                "SET" if cfg.api_id else "MISSING",
+                "SET" if cfg.api_hash else "MISSING",
+                f"SET ({len(cfg.session_string)} chars)" if cfg.session_string else "MISSING")
+
+    if not cfg.api_id or not cfg.api_hash:
+        logger.error("Telethon NOT configured: API_ID or API_HASH is missing in .env")
+        app.bot_data["user_session"] = None
+    elif not cfg.session_string:
+        logger.error("Telethon NOT configured: SESSION_STRING is missing in .env")
+        app.bot_data["user_session"] = None
+    else:
+        logger.info("Creating Telethon client (api_id=%s, session_string=%d chars)...",
+                    cfg.api_id, len(cfg.session_string))
         user_session = UserSession(
             cfg.session_name, cfg.api_id, cfg.api_hash,
             session_string=cfg.session_string,
@@ -67,16 +82,18 @@ async def post_init(app: Application) -> None:
         ok = await user_session.start()
         if ok:
             app.bot_data["user_session"] = user_session
+            logger.info("✓ Telethon session connected successfully")
         else:
             app.bot_data["user_session"] = None
-            logger.warning(
-                "Telethon session unavailable. Locked-channel forwarding and "
-                "topic auto-discovery will not work until you log in."
+            logger.error(
+                "✗ Telethon session FAILED to start. Possible causes:\n"
+                "  1. SESSION_STRING is invalid or has been revoked\n"
+                "  2. SESSION_STRING was generated with a different Telethon version\n"
+                "  3. Network issue connecting to Telegram\n"
+                "  4. API_ID/API_HASH mismatch\n"
+                "Fix: Re-run `python login.py --string` locally and update SESSION_STRING in .env\n"
+                "Then restart: docker-compose restart forwarder-bot"
             )
-    else:
-        app.bot_data["user_session"] = None
-        logger.info("Telethon not configured (API_ID/API_HASH missing). "
-                    "Only direct forwarding will work.")
 
     app.bot_data["topics"] = TopicManager(db, app.bot_data["user_session"])
 

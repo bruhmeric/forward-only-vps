@@ -154,9 +154,12 @@ class UserSession:
             logger.warning("Telethon session file missing — run python login.py first.")
             return False
         try:
+            logger.info("Telethon: connecting to Telegram...")
             await self.client.connect()
+            logger.info("Telethon: connected, checking authorization...")
             if not await self.client.is_user_authorized():
-                logger.warning("Telethon session exists but is not authorized.")
+                logger.warning("Telethon: session exists but is NOT authorized. "
+                               "The SESSION_STRING may be invalid or revoked.")
                 await self.client.disconnect()
                 return False
             self._started = True
@@ -164,8 +167,8 @@ class UserSession:
                         await self._safe_get_me(),
                         "string" if self._uses_string_session else "file")
             return True
-        except Exception:
-            logger.exception("Failed to start Telethon client")
+        except Exception as e:
+            logger.exception("Failed to start Telethon client: %s: %s", type(e).__name__, e)
             return False
 
     async def _safe_get_me(self) -> str:

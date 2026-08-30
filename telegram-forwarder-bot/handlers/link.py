@@ -47,8 +47,10 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     user_session: UserSession = context.bot_data.get("user_session")
     if not user_session:
         await update.effective_message.reply_text(
-            "Locked-channel forwarding needs a Telethon user session, but "
-            "none is configured. Run `python login.py` first."
+            "❌ Telethon session failed to start at boot.\n\n"
+            "Send /reconnect to retry.\n"
+            "If that fails, check logs: docker-compose logs forwarder-bot\n"
+            "Common fix: re-run `python login.py --string` locally and update SESSION_STRING in .env"
         )
         return
     # Auto-reconnect if the Telethon connection has dropped (Telegram idle

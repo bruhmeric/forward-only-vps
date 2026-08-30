@@ -119,6 +119,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/caption strip   — 📝 strip ALL captions from forwarded media\n"
         "/caption clear   — 📝 restore original captions\n"
         "/cancel         — cancel the latest pending forward\n"
+        "/reconnect     — retry Telethon connection (if session failed at boot)\n"
         "\n*Sending content*\n"
         "• Send me a photo / video / text / file -> I show topics (if forum) "
         "or a single Forward button (if not) -> tap to forward\n"
@@ -241,8 +242,8 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     topics_mgr = context.bot_data["topics"]
     if not topics_mgr.user_session:
         await update.effective_message.reply_text(
-            "Telethon user session not configured. Run `python login.py` first "
-            "(and configure API_ID/API_HASH)."
+            "Telethon user session failed to start at boot. "
+            "Send /reconnect to retry, or check logs: docker-compose logs forwarder-bot"
         )
         return
     # Auto-reconnect if the Telethon connection has dropped.
@@ -492,8 +493,10 @@ async def cmd_test_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user_session = context.bot_data.get("user_session")
     if not user_session:
         await update.effective_message.reply_text(
-            "❌ Telethon user session not configured.\n"
-            "Run `python login.py --string` locally and set SESSION_STRING env var."
+            "❌ Telethon session failed to start at boot.\n\n"
+            "Send /reconnect to retry.\n"
+            "If that fails, check logs: docker-compose logs forwarder-bot\n"
+            "Common fix: re-run `python login.py --string` locally and update SESSION_STRING in .env"
         )
         return
     # Auto-reconnect if the Telethon connection has dropped.
@@ -588,8 +591,10 @@ async def cmd_saved(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_session = context.bot_data.get("user_session")
     if not user_session:
         await update.effective_message.reply_text(
-            "❌ Telethon user session not configured.\n"
-            "Run `python login.py --string` locally and set SESSION_STRING env var."
+            "❌ Telethon session failed to start at boot.\n\n"
+            "Send /reconnect to retry.\n"
+            "If that fails, check logs: docker-compose logs forwarder-bot\n"
+            "Common fix: re-run `python login.py --string` locally and update SESSION_STRING in .env"
         )
         return
     # Auto-reconnect if the Telethon connection has dropped.
@@ -740,8 +745,10 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     user_session = context.bot_data.get("user_session")
     if not user_session:
         await update.effective_message.reply_text(
-            "❌ Telethon user session not configured.\n"
-            "Run `python login.py --string` locally and set SESSION_STRING env var."
+            "❌ Telethon session failed to start at boot.\n\n"
+            "Send /reconnect to retry.\n"
+            "If that fails, check logs: docker-compose logs forwarder-bot\n"
+            "Common fix: re-run `python login.py --string` locally and update SESSION_STRING in .env"
         )
         return
     # Auto-reconnect if the Telethon connection has dropped (Telegram idle
@@ -1323,6 +1330,70 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.effective_message.reply_text(f"Cancelled {n} pending forward(s).")
 
 
+async def cmd_reconnect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reconnect the Telethon user session without restarting the bot.
+
+    Useful if the session failed to start at boot (e.g. temporary network
+    issue) or if the connection dropped and auto-reconnect failed.
+    """
+    cfg = context.bot_data["config"]
+    if not cfg.is_admin(update.effective_user.id):
+        return
+
+    status_msg = await update.effective_message.reply_text("🔄 Reconnecting Telethon session...")
+
+    # Check if credentials are present
+    if not cfg.api_id or not cfg.api_hash:
+        await status_msg.edit_text(
+            "❌ Cannot reconnect: API_ID or API_HASH is missing in .env\n"
+            "Edit telegram-forwarder-bot/.env and restart: docker-compose restart forwarder-bot"
+        )
+        return
+    if not cfg.session_string:
+        await status_msg.edit_text(
+            "❌ Cannot reconnect: SESSION_STRING is missing in .env\n"
+            "Run `python login.py --string` locally, then update .env and restart."
+        )
+        return
+
+    # Stop existing session if any
+    old_session = context.bot_data.get("user_session")
+    if old_session:
+        try:
+            await old_session.stop()
+        except Exception:
+            pass
+
+    # Create and start a new session
+    from user_session import UserSession
+    new_session = UserSession(
+        cfg.session_name, cfg.api_id, cfg.api_hash,
+        session_string=cfg.session_string,
+    )
+    ok = await new_session.start()
+    if ok:
+        context.bot_data["user_session"] = new_session
+        # Re-init the TopicManager with the new session
+        from topics import TopicManager
+        context.bot_data["topics"] = TopicManager(context.bot_data["db"], new_session)
+        await status_msg.edit_text(
+            "✅ Telethon session reconnected successfully!\n"
+            "Locked-channel forwarding and topic discovery are now available."
+        )
+    else:
+        context.bot_data["user_session"] = None
+        await status_msg.edit_text(
+            "❌ Telethon session failed to reconnect.\n\n"
+            "Possible causes:\n"
+            "  1. SESSION_STRING is invalid or revoked\n"
+            "  2. Network issue connecting to Telegram\n"
+            "  3. API_ID/API_HASH mismatch\n\n"
+            "Fix: Re-run `python login.py --string` locally,\n"
+            "update SESSION_STRING in .env, then:\n"
+            "docker-compose restart forwarder-bot"
+        )
+
+
 def register_admin_handlers(app) -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -1341,3 +1412,4 @@ def register_admin_handlers(app) -> None:
     app.add_handler(CommandHandler("scrape_status", cmd_scrape_status))
     app.add_handler(CommandHandler("caption", cmd_caption))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("reconnect", cmd_reconnect))
