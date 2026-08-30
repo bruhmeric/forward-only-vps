@@ -966,6 +966,16 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         else:
             activity = "[SCANNING]"
 
+        # Calculate ETA if we have throughput data
+        eta_str = ""
+        if throughput > 0 and total_seen > sent:
+            remaining = total_seen - sent
+            eta_sec = remaining / (throughput / 60)
+            if eta_sec > 60:
+                eta_str = f"\nETA:       {eta_sec/60:.0f}m {eta_sec%60:.0f}s"
+            else:
+                eta_str = f"\nETA:       {eta_sec:.0f}s"
+
         return (
             f">>> SCRAPE IN PROGRESS <<<\n"
             f"{activity}\n\n"
@@ -980,6 +990,7 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             f"Elapsed:   {elapsed:.0f}s\n"
             f"Speed:     {throughput:.1f} items/min\n"
             f"Last ID:   {last_msg_id}"
+            f"{eta_str}"
         )
 
     async def _status_ticker():
@@ -1035,10 +1046,11 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     # Run the scrape as a background task
     async def scrape_task():
+        scrape_result = None
         try:
             # Load the custom_caption setting (None=original, ""=strip, "<text>"=custom)
             custom_caption = await _get_custom_caption(context)
-            result = await user_session.scrape_channel(
+            scrape_result = await user_session.scrape_channel(
                 source_chat_ref=int(parsed.chat_ref) if parsed.kind == "private" else parsed.chat_ref,
                 dest_chat_id=dest_chat_id,
                 topic_id=None,  # scraper doesn't support topics yet (use /saved for that)
@@ -1053,18 +1065,18 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             # ── Update cumulative stats (persisted to SQLite) ───────────────
             # These survive restarts and power the dashboard's "All-Time" stats.
             db = context.bot_data.get("db")
-            if db and isinstance(result, dict):
+            if db and isinstance(scrape_result, dict):
                 try:
                     await db.increment_stat("total_scrapes", 1)
-                    await db.increment_stat("total_sent", result.get("sent_count", 0))
-                    await db.increment_stat("total_failed", max(0, result.get("failed_count", 0)))
-                    await db.increment_stat("total_skipped", result.get("skipped_count", 0))
-                    await db.increment_stat("total_flood_waits", result.get("flood_waits", 0))
+                    await db.increment_stat("total_sent", scrape_result.get("sent_count", 0))
+                    await db.increment_stat("total_failed", max(0, scrape_result.get("failed_count", 0)))
+                    await db.increment_stat("total_skipped", scrape_result.get("skipped_count", 0))
+                    await db.increment_stat("total_flood_waits", scrape_result.get("flood_waits", 0))
                     logger.info("Cumulative stats updated: scrape complete "
                                 "(sent=%d, failed=%d, skipped=%d)",
-                                result.get("sent_count", 0),
-                                result.get("failed_count", 0),
-                                result.get("skipped_count", 0))
+                                scrape_result.get("sent_count", 0),
+                                scrape_result.get("failed_count", 0),
+                                scrape_result.get("skipped_count", 0))
                 except Exception as e:
                     logger.warning("Failed to update cumulative stats: %s", e)
         except Exception as e:
@@ -1083,9 +1095,50 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     await t
                 except Exception:
                     pass
-            # Do one final status update showing the completed scrape
+            # ── Show final completion message ───────────────────────────────
+            # Build a clear "DONE" message showing the final results, so the
+            # user knows the scrape finished successfully (or was cancelled).
             try:
-                final_text = _build_live_status_text()
+                elapsed = time.time() - started_at
+                if scrape_result and isinstance(scrape_result, dict):
+                    sent = scrape_result.get("sent_count", 0)
+                    failed = scrape_result.get("failed_count", 0)
+                    skipped = scrape_result.get("skipped_count", 0)
+                    total_seen = scrape_result.get("total_seen", 0)
+                    flood_waits = scrape_result.get("flood_waits", 0)
+                    last_id = scrape_result.get("last_message_id", 0)
+                    cancelled = scrape_result.get("cancelled", False)
+
+                    if cancelled:
+                        status_line = ">>> SCRAPE CANCELLED <<<"
+                    elif failed > 0 and sent == 0:
+                        status_line = ">>> SCRAPE COMPLETED (with errors) <<<"
+                    else:
+                        status_line = ">>> SCRAPE COMPLETE <<<"
+
+                    throughput = sent / (elapsed / 60) if elapsed > 60 else 0
+
+                    final_text = (
+                        f"{status_line}\n\n"
+                        f"Source:      {parsed.chat_ref}\n"
+                        f"Destination: {dest_label}\n"
+                        f"Duration:    {elapsed:.0f}s\n"
+                        f"----------------------------------------\n"
+                        f"Sent:        {sent}\n"
+                        f"Failed:      {failed}\n"
+                        f"Skipped:     {skipped}\n"
+                        f"Total seen:  {total_seen}\n"
+                        f"Flood waits: {flood_waits}\n"
+                        f"Last msg ID: {last_id}\n"
+                        f"----------------------------------------\n"
+                        f"Speed:       {throughput:.1f} items/min"
+                    )
+                else:
+                    final_text = (
+                        f">>> SCRAPE ENDED <<<\n\n"
+                        f"Duration: {elapsed:.0f}s\n"
+                        f"(No result data available — check logs for details)"
+                    )
                 await _edit_telegram_message_safe(final_text, force=True)
             except Exception:
                 pass

@@ -1244,7 +1244,7 @@ class UserSession:
         source_chat_id: int,
         source_message_ids: list[int],
         tmp_dir: str,
-        max_bytes: int = 50 * 1024 * 1024,
+        max_bytes: int = 2 * 1024 * 1024 * 1024,  # 2GB (Telegram's hard limit)
     ) -> tuple[list[dict], str | None, str | None, list[str]]:
         """Legacy fallback: download media from source chat to disk for
         re-upload via Bot API. Used when send_to_destination fails (e.g.,
@@ -1340,7 +1340,7 @@ class UserSession:
                 sz = os.path.getsize(out_path)
                 if sz > max_bytes:
                     diag.append(f"⚠ Skipping item {idx}: downloaded {sz/1024/1024:.1f} MB "
-                                f"(> {max_bytes/1024/1024:.0f} MB Bot API limit)")
+                                f"(> {max_bytes/1024/1024:.0f} MB Telegram limit)")
                     os.remove(out_path)
                     continue
                 media_paths.append({"path": out_path, "type": media_type})
@@ -1500,17 +1500,26 @@ class UserSession:
         # Helper: send one message with FloodWait handling
         async def _send_one(msg_id: int):
             """Send a single message via send_to_destination, with FloodWait
-            retry. Updates `result` in place. Returns True if sent."""
+            retry. Updates `result` in place. Returns True if sent.
+
+            NEVER raises — all exceptions are caught and counted as failures.
+            This ensures one bad message doesn't stop the entire scrape."""
             src_ref = source_chat_ref if isinstance(source_chat_ref, int) else source_entity.id
             result["in_flight"] += 1  # track active sends for real-time status
             try:
-                success, _ = await self.send_to_destination(
-                    source_chat_id=src_ref,
-                    source_message_ids=[msg_id],
-                    dest_chat_id=dest_chat_id,
-                    topic_id=topic_id,
-                    progress_callback=None,
-                    custom_caption=custom_caption,
+                # Use a timeout so a stuck send (e.g. network hang on a huge
+                # file) doesn't block the scrape forever. 10 min per file is
+                # generous — even a 2GB file at 5MB/s takes ~7 min.
+                success, _ = await _asyncio.wait_for(
+                    self.send_to_destination(
+                        source_chat_id=src_ref,
+                        source_message_ids=[msg_id],
+                        dest_chat_id=dest_chat_id,
+                        topic_id=topic_id,
+                        progress_callback=None,
+                        custom_caption=custom_caption,
+                    ),
+                    timeout=600,  # 10 minutes per file max
                 )
                 if success:
                     result["sent_count"] += 1
@@ -1528,19 +1537,26 @@ class UserSession:
                 await _asyncio.sleep(wait_seconds)
                 # Retry once
                 try:
-                    success, _ = await self.send_to_destination(
-                        source_chat_id=src_ref,
-                        source_message_ids=[msg_id],
-                        dest_chat_id=dest_chat_id,
-                        topic_id=topic_id,
-                        progress_callback=None,
-                        custom_caption=custom_caption,
+                    success, _ = await _asyncio.wait_for(
+                        self.send_to_destination(
+                            source_chat_id=src_ref,
+                            source_message_ids=[msg_id],
+                            dest_chat_id=dest_chat_id,
+                            topic_id=topic_id,
+                            progress_callback=None,
+                            custom_caption=custom_caption,
+                        ),
+                        timeout=600,
                     )
                     if success:
                         result["sent_count"] += 1
                         return True
                 except Exception:
                     pass
+                result["failed_count"] += 1
+                return False
+            except _asyncio.TimeoutError:
+                logger.warning("scrape: send timed out for msg %d (10min limit)", msg_id)
                 result["failed_count"] += 1
                 return False
             except Exception as e:

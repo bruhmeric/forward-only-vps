@@ -27,11 +27,10 @@ logger = logging.getLogger(__name__)
 
 LINK_FILTER = filters.Regex(r"(https?://)?t(?:elegram)?\.me/")
 
-# Heuristic: in a single user message, accept up to ~50MB total to keep
-# memory / disk usage reasonable. Real limit is the Bot API's 50MB upload
-# cap for documents / 2GB for videos sent via sendVideo by URL — but we're
-# re-uploading from disk, so the cap is 50MB.
-MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
+# No file size limit — Telethon handles files up to 2GB (Telegram's hard limit)
+# via InputFileBig. The old 50MB limit was for the Bot API's sendDocument
+# cap, but we use Telethon's send_file which supports up to 2GB.
+MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2GB (Telegram's hard limit)
 
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -271,7 +270,7 @@ async def _download_media(user_session: UserSession, msg, tmp_dir: str, idx: int
             file_size = msg.media.document.size or 0
             if file_size > MAX_DOWNLOAD_BYTES:
                 mb = file_size / (1024 * 1024)
-                return None, f"file too large ({mb:.1f} MB > {MAX_DOWNLOAD_BYTES/1024/1024:.0f} MB limit)"
+                return None, f"file too large ({mb:.1f} MB > 2048 MB Telegram limit)"
         elif isinstance(msg.media, tl.MessageMediaPhoto) and msg.media.photo:
             # Photo sizes are in msg.media.photo.sizes; the largest is the
             # last one (or one with type='x')
@@ -281,7 +280,7 @@ async def _download_media(user_session: UserSession, msg, tmp_dir: str, idx: int
                 file_size = getattr(largest, "size", 0) or 0
                 if file_size > MAX_DOWNLOAD_BYTES:
                     mb = file_size / (1024 * 1024)
-                    return None, f"photo too large ({mb:.1f} MB > {MAX_DOWNLOAD_BYTES/1024/1024:.0f} MB limit)"
+                    return None, f"photo too large ({mb:.1f} MB > 2048 MB Telegram limit)"
     except Exception:
         pass  # best-effort size check; proceed with download
 
@@ -314,7 +313,7 @@ async def _download_media(user_session: UserSession, msg, tmp_dir: str, idx: int
         except OSError:
             pass
         mb = sz / (1024 * 1024)
-        return None, f"downloaded file too large ({mb:.1f} MB > {MAX_DOWNLOAD_BYTES/1024/1024:.0f} MB Bot API limit)"
+        return None, f"downloaded file too large ({mb:.1f} MB > 2048 MB Telegram limit)"
 
     return {"path": out_path, "type": media_type}, None
 
