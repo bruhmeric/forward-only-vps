@@ -1726,146 +1726,255 @@ class UserSession:
                     still_pending.append(t)
             pending_send_tasks = still_pending
 
-        # ── Main iteration loop with auto-reconnect ────────────────────────
-        current_min_id = min_id  # tracks where to resume after reconnect
+        # ── Main iteration loop: manual chunked pagination ─────────────────
+        # WHY NOT iter_messages():
+        #   iter_messages() fetches 100 msgs per getHistory call with a default
+        #   inter-chunk delay of only 1s (or 0s with explicit limit). Telegram's
+        #   budget is ~30s per 10 requests (3s/request). After ~1800 messages
+        #   (18 calls), FloodWait escalates past Telethon's flood_sleep_threshold
+        #   (60s) → FloodWaitError is raised → scrape dies.
+        #
+        # FIX: Manual chunked get_messages with offset_id pagination:
+        #   - Fetch 100 messages per call
+        #   - Sleep 3s between batches (respects Telegram's budget)
+        #   - Catch FloodWaitError explicitly, sleep e.seconds, retry same offset_id
+        #   - Check cancellation between every batch and every message
+        #
+        # offset_id is a pagination cursor (exclusive): "messages older than this ID"
+        # We advance it to the OLDEST id in each batch (messages come newest→oldest)
+        BATCH_SIZE = 100
+        BATCH_DELAY = 3  # seconds between batches (≥3 to respect Telegram's budget)
+        MAX_FLOOD_RETRIES = 10
 
-        while not (cancel_event and cancel_event.is_set()):
-            # Check cancellation at the top of every loop
+        # For reverse=True (oldest first), we need a different approach:
+        # use min_id to paginate forward through history.
+        # For reverse=False (newest first, default), use offset_id to paginate backward.
+        current_offset_id = min_id if min_id > 0 else 0
+        current_min_id_for_reverse = min_id if min_id > 0 else 0
+
+        scrape_done = False
+        while not scrape_done:
+            # Check cancellation at the top of every batch
             if cancel_event and cancel_event.is_set():
                 result["cancelled"] = True
                 break
 
-            # Ensure connected before iterating
+            # Ensure connected before fetching
             if not await self._ensure_connected():
                 if status_callback:
                     await status_callback("❌ Connection lost and reconnect failed. Stopping scrape.")
                 result["failed_count"] = -1
                 return result
 
-            # Build iter_kwargs with resume point
-            resume_kwargs = dict(iter_kwargs)
-            if current_min_id > 0:
-                resume_kwargs["min_id"] = current_min_id
-
-            try:
-                async for msg in self.client.iter_messages(source_entity, **resume_kwargs):
-                    # Check cancellation at every message
-                    if cancel_event and cancel_event.is_set():
-                        result["cancelled"] = True
-                        if pending_send_tasks:
-                            if status_callback:
-                                await status_callback(
-                                    f"🛑 Cancel received. Waiting for "
-                                    f"{len(pending_send_tasks)} in-flight send(s)..."
-                                )
-                            await _asyncio.gather(*pending_send_tasks, return_exceptions=True)
-                        if status_callback:
-                            await status_callback(
-                                f"🛑 Scraping cancelled by user.\n"
-                                f"   Sent: {result['sent_count']}, "
-                                f"Failed: {result['failed_count']}, "
-                                f"Skipped: {result['skipped_count']}"
-                            )
-                        break
-
-                    result["total_seen"] += 1
-                    result["last_message_id"] = msg.id
-                    current_min_id = msg.id  # track for resume after reconnect
-
-                    m_type = _classify_media(msg)
-                    if m_type is None:
-                        result["skipped_count"] += 1
-                        continue
-
-                    if media_types is not None:
-                        type_check = m_type
-                        if type_check == "video_note":
-                            type_check = "video"
-                        if type_check not in media_types:
-                            result["skipped_count"] += 1
-                            continue
-
-                    # Schedule the send in parallel
-                    task = _asyncio.create_task(_send_with_semaphore(msg))
-                    pending_send_tasks.append(task)
-
-                    # Drain on EVERY iteration — prevents memory leak on
-                    # massive channels (old code only drained when
-                    # pending >= parallel*4, causing accumulation)
-                    _drain_done_tasks()
-
-                    # If we have too many pending, wait for some to complete
-                    if len(pending_send_tasks) >= parallel * 2:
-                        done, pending = await _asyncio.wait(
-                            pending_send_tasks, return_when=_asyncio.FIRST_COMPLETED,
-                        )
-                        for t in done:
-                            try:
-                                t.result()
-                            except Exception:
-                                pass
-                        pending_send_tasks = list(pending)
-
-                    # Progress callback
-                    if progress_callback:
-                        try:
-                            await progress_callback(
-                                result["sent_count"],
-                                result["total_seen"],
-                                result["last_message_id"],
-                                f"Sent {result['sent_count']} / seen {result['total_seen']}",
-                            )
-                        except Exception:
-                            pass
-
-                    # Periodic status update
-                    now = _time.time()
-                    if status_callback and now - last_status_time > status_interval:
-                        last_status_time = now
+            # Fetch one batch of messages with FloodWait retry
+            batch_msgs = None
+            for attempt in range(MAX_FLOOD_RETRIES):
+                if cancel_event and cancel_event.is_set():
+                    break
+                try:
+                    if reverse:
+                        # Oldest-first: use min_id to paginate forward
+                        fetch_kwargs = {"limit": BATCH_SIZE, "reverse": True}
+                        if current_min_id_for_reverse > 0:
+                            fetch_kwargs["min_id"] = current_min_id_for_reverse
+                        batch_msgs = await self.client.get_messages(source_entity, **fetch_kwargs)
+                    else:
+                        # Newest-first: use offset_id to paginate backward
+                        fetch_kwargs = {"limit": BATCH_SIZE}
+                        if current_offset_id > 0:
+                            fetch_kwargs["offset_id"] = current_offset_id
+                        batch_msgs = await self.client.get_messages(source_entity, **fetch_kwargs)
+                    break
+                except FloodWaitError as e:
+                    result["flood_waits"] += 1
+                    wait_seconds = e.seconds + 2
+                    if status_callback:
                         await status_callback(
-                            f"📊 Scraping in progress...\n\n"
-                            f"Total seen: {result['total_seen']}\n"
-                            f"Sent: {result['sent_count']}\n"
-                            f"Failed: {result['failed_count']}\n"
-                            f"Skipped: {result['skipped_count']}\n"
-                            f"Last msg ID: {result['last_message_id']}\n"
-                            f"Parallel sends: {parallel}"
+                            f"⏳ Flood wait on get_messages: sleeping {wait_seconds}s "
+                            f"(attempt {attempt+1}/{MAX_FLOOD_RETRIES})...\n"
+                            f"   Sent so far: {result['sent_count']}, Seen: {result['total_seen']}"
                         )
-
-                    if stats_callback:
-                        try:
-                            await stats_callback(result)
-                        except Exception:
-                            pass
-
-                # If we get here, iter_messages completed without error.
-                # Break out of the while loop — we're done.
-                break
-
-            except ConnectionError as e:
-                logger.warning("scrape_channel: connection dropped: %s", e)
+                    # Sleep in chunks so we can be interrupted by cancel
+                    end_wait = _time.time() + wait_seconds
+                    while _time.time() < end_wait:
+                        if cancel_event and cancel_event.is_set():
+                            break
+                        await _asyncio.sleep(min(5, end_wait - _time.time()))
+                    if cancel_event and cancel_event.is_set():
+                        break
+                    # Retry the same batch (offset_id unchanged)
+                    continue
+                except ConnectionError as e:
+                    logger.warning("scrape_channel: connection dropped during get_messages: %s", e)
+                    if status_callback:
+                        await status_callback(f"⚠️ Connection dropped. Reconnecting...")
+                    await _asyncio.sleep(2)
+                    if not await self._ensure_connected():
+                        if status_callback:
+                            await status_callback("❌ Reconnect failed. Stopping scrape.")
+                        result["failed_count"] = -1
+                        return result
+                    continue  # retry the same batch
+                except _asyncio.CancelledError:
+                    result["cancelled"] = True
+                    break
+                except Exception as e:
+                    logger.exception("scrape_channel: get_messages failed")
+                    if status_callback:
+                        await status_callback(f"❌ Fetch error: {type(e).__name__}: {e}")
+                    result["failed_count"] = -1
+                    return result
+            else:
+                # Exhausted all flood retries
                 if status_callback:
                     await status_callback(
-                        f"⚠️ Connection dropped. Reconnecting and resuming from msg {current_min_id}..."
+                        f"❌ Exhausted {MAX_FLOOD_RETRIES} flood retries. Stopping scrape.\n"
+                        f"   Sent: {result['sent_count']}, Seen: {result['total_seen']}"
                     )
-                # _ensure_connected is called at the top of the while loop
-                # The while loop will retry iter_messages with current_min_id
-                await _asyncio.sleep(2)  # brief pause before reconnect
-                continue
-
-            except _asyncio.CancelledError:
-                result["cancelled"] = True
-                break
-
-            except Exception as e:
-                logger.exception("scrape_channel: iter_messages failed")
-                if status_callback:
-                    await status_callback(f"❌ Scrape error: {type(e).__name__}: {e}")
                 result["failed_count"] = -1
                 return result
 
+            # Check if cancelled during fetch
+            if cancel_event and cancel_event.is_set():
+                result["cancelled"] = True
+                break
+
+            # Check if we've reached the end of history
+            if not batch_msgs:
+                scrape_done = True
+                break
+
+            # Process each message in the batch
+            for msg in batch_msgs:
+                if cancel_event and cancel_event.is_set():
+                    result["cancelled"] = True
+                    break
+
+                if msg is None:
+                    continue
+
+                result["total_seen"] += 1
+                result["last_message_id"] = msg.id
+
+                # Update pagination cursor
+                if reverse:
+                    # For oldest-first, track the highest id to advance forward
+                    if msg.id > current_min_id_for_reverse:
+                        current_min_id_for_reverse = msg.id
+                else:
+                    # For newest-first, track the lowest id to go backward
+                    # (messages come newest→oldest, so the last one is the oldest)
+                    pass  # we'll set current_offset_id after the loop
+
+            if result["cancelled"]:
+                break
+
+            # Set offset_id to the OLDEST message in this batch for next iteration
+            if batch_msgs and not reverse:
+                # batch_msgs is newest→oldest, so last is the oldest
+                current_offset_id = batch_msgs[-1].id
+            elif batch_msgs and reverse:
+                # batch_msgs is oldest→newest, so last is the newest
+                # current_min_id_for_reverse already updated in the loop
+                pass
+
+            # Now process messages for sending (filter + schedule sends)
+            for msg in batch_msgs:
+                if cancel_event and cancel_event.is_set():
+                    result["cancelled"] = True
+                    break
+                if msg is None:
+                    continue
+
+                m_type = _classify_media(msg)
+                if m_type is None:
+                    result["skipped_count"] += 1
+                    continue
+
+                if media_types is not None:
+                    type_check = m_type
+                    if type_check == "video_note":
+                        type_check = "video"
+                    if type_check not in media_types:
+                        result["skipped_count"] += 1
+                        continue
+
+                # Schedule the send in parallel
+                task = _asyncio.create_task(_send_with_semaphore(msg))
+                pending_send_tasks.append(task)
+
+            # Drain completed tasks
+            _drain_done_tasks()
+
+            # If we have too many pending, wait for some to complete
+            if len(pending_send_tasks) >= parallel * 2:
+                done, pending = await _asyncio.wait(
+                    pending_send_tasks, return_when=_asyncio.FIRST_COMPLETED,
+                )
+                for t in done:
+                    try:
+                        t.result()
+                    except Exception:
+                        pass
+                pending_send_tasks = list(pending)
+
+            # Progress callback
+            if progress_callback:
+                try:
+                    await progress_callback(
+                        result["sent_count"],
+                        result["total_seen"],
+                        result["last_message_id"],
+                        f"Sent {result['sent_count']} / seen {result['total_seen']}",
+                    )
+                except Exception:
+                    pass
+
+            # Periodic status update
+            now = _time.time()
+            if status_callback and now - last_status_time > status_interval:
+                last_status_time = now
+                await status_callback(
+                    f"📊 Scraping in progress...\n\n"
+                    f"Total seen: {result['total_seen']}\n"
+                    f"Sent: {result['sent_count']}\n"
+                    f"Failed: {result['failed_count']}\n"
+                    f"Skipped: {result['skipped_count']}\n"
+                    f"Last msg ID: {result['last_message_id']}\n"
+                    f"Parallel sends: {parallel}"
+                )
+
+            if stats_callback:
+                try:
+                    await stats_callback(result)
+                except Exception:
+                    pass
+
+            # If we got fewer than BATCH_SIZE messages, we've reached the end
+            if len(batch_msgs) < BATCH_SIZE:
+                scrape_done = True
+                break
+
+            # Check cancellation before sleeping
+            if cancel_event and cancel_event.is_set():
+                result["cancelled"] = True
+                break
+
+            # Sleep between batches to respect Telegram's rate limit
+            # Sleep in 1-second chunks so we can be interrupted by cancel
+            for _ in range(BATCH_DELAY):
+                if cancel_event and cancel_event.is_set():
+                    result["cancelled"] = True
+                    break
+                await _asyncio.sleep(1)
+
         # Wait for any remaining in-flight send tasks to complete
         if pending_send_tasks:
+            if cancel_event and cancel_event.is_set():
+                # Cancel all pending tasks on stop
+                for t in pending_send_tasks:
+                    if not t.done():
+                        t.cancel()
             try:
                 await _asyncio.gather(*pending_send_tasks, return_exceptions=True)
             except Exception:

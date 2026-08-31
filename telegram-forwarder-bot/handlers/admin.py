@@ -1253,17 +1253,21 @@ async def cmd_caption(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def cmd_stop_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Stop the currently running scrape.
 
-    Uses a two-tier approach:
+    Uses a three-tier approach:
     1. Set the cancel_event (graceful — scrape stops at next check point)
     2. If the scrape doesn't stop within 10 seconds, forcefully cancel the task
+    3. If that doesn't work either, disconnect the Telethon client (tears down
+       the blocked transport, unblocking any stuck socket reads)
+
     This ensures /stop_scrape ALWAYS works, even when the scrape is stuck
-    in an error loop or a long FloodWait.
+    in a blocking I/O call that doesn't respond to task.cancel().
     """
     cfg = context.bot_data["config"]
     if not cfg.is_admin(update.effective_user.id):
         return
     cancel_event = context.bot_data.get("scrape_cancel")
     task = context.bot_data.get("scrape_task")
+    user_session = context.bot_data.get("user_session")
     if not task or task.done():
         await update.effective_message.reply_text("No active scrape to stop.")
         return
@@ -1289,17 +1293,38 @@ async def cmd_stop_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Tier 2: Force cancel the task
         try:
             task.cancel()
-            await _asyncio.sleep(1)
-            await status_msg.edit_text(
-                "🛑 Scrape force-stopped (didn't respond to graceful cancel within 10s).\n"
-                "Use /scrape_status to see final stats."
-            )
-        except Exception as e:
-            await status_msg.edit_text(
-                f"🛑 Stop signal sent but scrape may still be running.\n"
-                f"Force cancel error: {type(e).__name__}: {e}\n"
-                f"Try: docker-compose restart forwarder-bot"
-            )
+            await _asyncio.sleep(3)
+            if task.done():
+                await status_msg.edit_text(
+                    "🛑 Scrape force-stopped via task.cancel().\n"
+                    "Use /scrape_status to see final stats."
+                )
+                return
+        except Exception:
+            pass
+
+        # Tier 3: Disconnect the Telethon client (last resort)
+        # This tears down the blocked transport, unblocking any stuck
+        # socket reads in get_messages or send_file.
+        if user_session:
+            try:
+                await status_msg.edit_text(
+                    "🛑 Scrape didn't respond to cancel. Disconnecting Telethon client..."
+                )
+                await user_session.client.disconnect()
+                await _asyncio.sleep(2)
+                # Reconnect for future use
+                await user_session._ensure_connected()
+                await status_msg.edit_text(
+                    "🛑 Scrape force-stopped via client disconnect.\n"
+                    "Telethon reconnected. Use /scrape_status to see final stats."
+                )
+            except Exception as e:
+                await status_msg.edit_text(
+                    f"🛑 Force-stop attempted.\n"
+                    f"Error: {type(e).__name__}: {e}\n"
+                    f"Try: docker-compose restart forwarder-bot"
+                )
     else:
         await status_msg.edit_text(
             "✅ Scrape stopped gracefully.\n"
