@@ -113,6 +113,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/test_link <url>  — diagnostic: test fetching a t.me link\n"
         "/saved <url>    — 🚀 FAST: send t.me link content to Saved Messages\n"
         "/scrape <url> [flags]  — 🤖 AUTO: scrape ALL media from a channel\n"
+        "/scrapeid <url> [start] [end] [saved] [keep]  — 🚀 FAST: forward by ID (no rate limits)\n"
         "/stop_scrape    — 🛑 stop the active scrape\n"
         "/scrape_status  — 📊 check scrape progress\n"
         "/caption <text>  — 📝 set a custom caption (replaces original)\n"
@@ -1457,6 +1458,248 @@ async def cmd_reconnect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
 
 
+async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Forward messages by ID range — NO getHistory, avoids rate limits.
+
+    Usage:
+      /scrapeid <url>                    — forward ALL messages (auto-detect range)
+      /scrapeid <url> 1 5000             — forward IDs 1 to 5000
+      /scrapeid <url> 1000 2000 saved    — forward IDs 1000-2000 to Saved Messages
+      /scrapeid <url> 1 5000 keep        — keep "Forwarded from" header
+
+    This is the RECOMMENDED method for large public channels because:
+    - Uses forward_messages(ids, from_peer) — no getHistory API calls
+    - Uses the SEND rate-limit bucket (not getHistory)
+    - 100 messages per API call
+    - No ~1800-message FloodWait cliff
+    - Works for channels with 50k+ messages
+
+    For protected channels (content protection enabled), use /scrape instead.
+    """
+    import asyncio
+    import time as _time
+    from user_session import parse_channel_link, parse_telegram_link
+    cfg = context.bot_data["config"]
+    if not cfg.is_admin(update.effective_user.id):
+        logger.warning("/scrapeid DENIED — user_id=%s not in ADMIN_IDS=%s",
+                       update.effective_user.id, cfg.admin_ids)
+        return
+    user_session = context.bot_data.get("user_session")
+    if not user_session:
+        await update.effective_message.reply_text(
+            "❌ Telethon session failed to start at boot.\n\n"
+            "Send /reconnect to retry."
+        )
+        return
+    if not await user_session._ensure_connected():
+        await update.effective_message.reply_text(
+            "❌ Telethon session disconnected. Try /reconnect or restart."
+        )
+        return
+
+    # Check if there's already an active scrape
+    if context.bot_data.get("scrape_task") and not context.bot_data["scrape_task"].done():
+        await update.effective_message.reply_text(
+            "⚠️ A scrape is already running. Use /stop_scrape to stop it first."
+        )
+        return
+
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Usage: `/scrapeid <url> [start_id] [end_id] [saved] [keep]`\n\n"
+            "Examples:\n"
+            "  `/scrapeid https://t.me/channelname`\n"
+            "  `/scrapeid https://t.me/channelname 1 5000`\n"
+            "  `/scrapeid https://t.me/c/1234567890 1000 2000 saved`\n"
+            "  `/scrapeid https://t.me/channelname 1 10000 keep`\n\n"
+            "Flags:\n"
+            "  `saved` — send to Saved Messages instead of destination group\n"
+            "  `keep`  — keep 'Forwarded from' header (default: strip)\n\n"
+            "This method uses forward_messages by ID — NO getHistory rate limits.\n"
+            "Recommended for large public channels (10k+ messages).",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Parse args
+    url = context.args[0]
+    raw_flags = [a.lower() for a in context.args[1:]]
+    send_to_saved = "saved" in raw_flags
+    keep_author = "keep" in raw_flags
+
+    # Parse start_id and end_id
+    start_id = 1
+    end_id = 0  # 0 = auto-detect
+    id_args = [a for a in raw_flags if a not in ("saved", "keep")]
+    if len(id_args) >= 1:
+        try:
+            start_id = int(id_args[0])
+        except ValueError:
+            await update.effective_message.reply_text(f"❌ Invalid start_id: {id_args[0]}")
+            return
+    if len(id_args) >= 2:
+        try:
+            end_id = int(id_args[1])
+        except ValueError:
+            await update.effective_message.reply_text(f"❌ Invalid end_id: {id_args[1]}")
+            return
+
+    # Parse URL
+    parsed = parse_channel_link(url)
+    if not parsed:
+        parsed_post = parse_telegram_link(url)
+        if parsed_post:
+            parsed = type(parsed_post)(kind=parsed_post.kind,
+                                        chat_ref=parsed_post.chat_ref,
+                                        message_id=0)
+    if not parsed:
+        await update.effective_message.reply_text(
+            f"❌ Could not parse URL: `{url}`\n\n"
+            f"Supported:\n"
+            f"  • `https://t.me/c/1234567890` (private)\n"
+            f"  • `https://t.me/channelname` (public)",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Determine destination
+    if send_to_saved:
+        dest_chat_id = "me"
+        dest_label = "Saved Messages"
+    else:
+        db = context.bot_data["db"]
+        dest_chat_id = cfg.destination_group_id
+        if dest_chat_id is None:
+            v = await db.get_runtime("destination_group_id")
+            dest_chat_id = int(v) if v else None
+        if dest_chat_id is None:
+            await update.effective_message.reply_text(
+                "No destination group set. Either:\n"
+                "  • /setgroup <group_id> first, OR\n"
+                "  • Use /scrapeid <url> ... saved"
+            )
+            return
+        dest_label = f"chat {dest_chat_id}"
+
+    # Initial status message
+    range_str = f"{start_id} to {'auto' if end_id == 0 else end_id}"
+    status_msg = await update.effective_message.reply_text(
+        f"🚀 Starting ID-based forward...\n\n"
+        f"Source: `{parsed.chat_ref}`\n"
+        f"Destination: {dest_label}\n"
+        f"ID range: {range_str}\n"
+        f"Keep author: {keep_author}\n\n"
+        f"_Uses forward_messages by ID — no getHistory rate limits._\n"
+        f"_Send /stop_scrape to cancel._",
+        parse_mode="Markdown",
+    )
+
+    # Set up cancellation and status
+    cancel_event = asyncio.Event()
+    context.bot_data["scrape_cancel"] = cancel_event
+    context.bot_data["scrape_status"] = {
+        "sent_count": 0, "failed_count": 0, "skipped_count": 0,
+        "total_seen": 0, "last_message_id": 0, "started_at": _time.time(),
+        "source_ref": parsed.chat_ref, "dest_label": dest_label,
+        "order": "id-ascending", "filter": "ALL (forward by ID)",
+        "parallel": 100, "in_flight": 0,
+    }
+
+    # Status callbacks
+    last_edit_time = {"time": 0.0}
+    started_at = _time.time()
+
+    async def _edit_status(text, force=False):
+        now = _time.time()
+        if not force and now - last_edit_time["time"] < 2.0:
+            return
+        last_edit_time["time"] = now
+        try:
+            await status_msg.edit_text(text)
+        except Exception:
+            pass
+
+    async def status_callback(text):
+        context.bot_data["scrape_status"]["last_update"] = _time.time()
+        await _edit_status(text, force=True)
+
+    async def stats_callback(result_dict):
+        context.bot_data["scrape_status"].update({
+            "sent_count": result_dict.get("sent_count", 0),
+            "failed_count": result_dict.get("failed_count", 0),
+            "total_seen": result_dict.get("total_seen", 0),
+            "last_message_id": result_dict.get("last_message_id", 0),
+            "flood_waits": result_dict.get("flood_waits", 0),
+            "in_flight": result_dict.get("in_flight", 0),
+            "last_update": _time.time(),
+        })
+
+    # Run as background task
+    async def scrape_task():
+        scrape_result = None
+        try:
+            scrape_result = await user_session.scrape_channel_by_ids(
+                source_chat_ref=int(parsed.chat_ref) if parsed.kind == "private" else parsed.chat_ref,
+                dest_chat_id=dest_chat_id,
+                start_id=start_id,
+                end_id=end_id,
+                cancel_event=cancel_event,
+                status_callback=status_callback,
+                stats_callback=stats_callback,
+                drop_author=not keep_author,
+            )
+            # Update cumulative stats
+            db = context.bot_data.get("db")
+            if db and isinstance(scrape_result, dict):
+                try:
+                    await db.increment_stat("total_scrapes", 1)
+                    await db.increment_stat("total_sent", scrape_result.get("sent_count", 0))
+                    await db.increment_stat("total_failed", max(0, scrape_result.get("failed_count", 0)))
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.exception("/scrapeid task failed")
+            try:
+                await status_msg.edit_text(f"❌ Scrape crashed: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+        finally:
+            # Show final completion message
+            try:
+                elapsed = _time.time() - started_at
+                if scrape_result and isinstance(scrape_result, dict):
+                    sent = scrape_result.get("sent_count", 0)
+                    failed = scrape_result.get("failed_count", 0)
+                    total = scrape_result.get("total_seen", 0)
+                    flood = scrape_result.get("flood_waits", 0)
+                    last_id = scrape_result.get("last_message_id", 0)
+                    cancelled = scrape_result.get("cancelled", False)
+
+                    status_line = ">>> SCRAPE CANCELLED <<<" if cancelled else ">>> SCRAPE COMPLETE <<<"
+                    final_text = (
+                        f"{status_line}\n\n"
+                        f"Source:      {parsed.chat_ref}\n"
+                        f"Destination: {dest_label}\n"
+                        f"Duration:    {elapsed:.0f}s\n"
+                        f"----------------------------------------\n"
+                        f"Sent:        {sent}\n"
+                        f"Failed:      {failed}\n"
+                        f"Total IDs:   {total}\n"
+                        f"Flood waits: {flood}\n"
+                        f"Last ID:     {last_id}"
+                    )
+                else:
+                    final_text = f">>> SCRAPE ENDED <<<\nDuration: {elapsed:.0f}s"
+                await _edit_status(final_text, force=True)
+            except Exception:
+                pass
+            context.bot_data.pop("scrape_task", None)
+            context.bot_data.pop("scrape_cancel", None)
+
+    context.bot_data["scrape_task"] = asyncio.create_task(scrape_task())
+    logger.info("ID-based scrape started for %s -> %s", parsed.chat_ref, dest_label)
+
+
 def register_admin_handlers(app) -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -1471,6 +1714,7 @@ def register_admin_handlers(app) -> None:
     app.add_handler(CommandHandler("test_link", cmd_test_link))
     app.add_handler(CommandHandler("saved", cmd_saved))
     app.add_handler(CommandHandler("scrape", cmd_scrape))
+    app.add_handler(CommandHandler("scrapeid", cmd_scrapeid))
     app.add_handler(CommandHandler("stop_scrape", cmd_stop_scrape))
     app.add_handler(CommandHandler("scrape_status", cmd_scrape_status))
     app.add_handler(CommandHandler("caption", cmd_caption))

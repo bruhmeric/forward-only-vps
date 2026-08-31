@@ -1995,6 +1995,301 @@ class UserSession:
 
         return result
 
+    # ---------- ID-based scraping (NO getHistory — avoids rate limits) ------
+
+    async def scrape_channel_by_ids(
+        self,
+        source_chat_ref,
+        dest_chat_id,
+        start_id: int = 1,
+        end_id: int = 0,
+        cancel_event=None,
+        status_callback=None,
+        stats_callback=None,
+        drop_author: bool = True,
+        batch_size: int = 100,
+        batch_delay: float = 1.5,
+    ) -> dict:
+        """Forward messages from a public channel by ID range — NO getHistory.
+
+        This is the OPTIMAL method for bulk-forwarding large public channels:
+        - Uses `forward_messages(dest, msg_ids, from_peer)` which takes IDs
+          directly — no need to read messages via getHistory first
+        - Uses the SEND rate-limit bucket (not the getHistory bucket)
+        - 100 messages per API call (Telegram's max per forwardMessages)
+        - Completely avoids the ~1800-message FloodWait cliff
+
+        Args:
+          source_chat_ref: chat_id (int) or username (str) of the source channel
+          dest_chat_id: destination chat_id (int) or "me" for Saved Messages
+          start_id: first message ID to forward (default: 1 = oldest)
+          end_id: last message ID to forward (0 = auto-detect latest)
+          cancel_event: asyncio.Event — set to cancel
+          status_callback: async callable(status_text)
+          stats_callback: async callable(result_dict)
+          drop_author: if True, strips "Forwarded from" header
+          batch_size: messages per forwardMessages call (max 100)
+          batch_delay: seconds between batches (1.5s is safe for send limits)
+
+        Returns:
+          dict with sent_count, failed_count, total_seen, last_message_id, etc.
+        """
+        from telethon.errors import FloodWaitError, MessageIdInvalidError
+        from telethon.tl.functions.messages import GetSplitRangesRequest
+        import asyncio as _asyncio
+        import time as _time
+
+        result = {
+            "sent_count": 0,
+            "failed_count": 0,
+            "skipped_count": 0,
+            "total_seen": 0,
+            "last_message_id": 0,
+            "cancelled": False,
+            "flood_waits": 0,
+            "in_flight": 0,
+            "started_at": time.time(),
+        }
+
+        # Clamp batch_size to 100 (Telegram's hard limit)
+        batch_size = min(batch_size, 100)
+
+        # Resolve entities ONCE
+        try:
+            source_entity = await self._resolve_entity(source_chat_ref, None)
+            dest_entity = await self._resolve_entity(dest_chat_id, None)
+        except Exception as e:
+            if status_callback:
+                await status_callback(f"❌ Failed to resolve entities: {type(e).__name__}: {e}")
+            result["failed_count"] = -1
+            return result
+
+        # Auto-detect end_id if not provided
+        if end_id <= 0:
+            if status_callback:
+                await status_callback("🔍 Detecting latest message ID...")
+            try:
+                latest = await self.client.get_messages(source_entity, limit=1)
+                if latest:
+                    msg = latest[0] if isinstance(latest, list) else latest
+                    end_id = getattr(msg, "id", 0)
+                    if status_callback:
+                        await status_callback(
+                            f"✓ Latest message ID: {end_id}\n"
+                            f"  Will forward IDs {start_id} to {end_id} "
+                            f"({end_id - start_id + 1} messages)"
+                        )
+                else:
+                    if status_callback:
+                        await status_callback("❌ Channel appears empty")
+                    return result
+            except Exception as e:
+                if status_callback:
+                    await status_callback(f"❌ Failed to detect latest ID: {type(e).__name__}: {e}")
+                result["failed_count"] = -1
+                return result
+
+        if end_id < start_id:
+            if status_callback:
+                await status_callback(f"❌ end_id ({end_id}) < start_id ({start_id})")
+            return result
+
+        if status_callback:
+            await status_callback(
+                f"🚀 Starting ID-based forward: {source_chat_ref} → {dest_chat_id}\n"
+                f"   IDs {start_id} to {end_id} ({end_id - start_id + 1} messages)\n"
+                f"   Batch: {batch_size} msgs/call, delay: {batch_delay}s\n"
+                f"   drop_author: {drop_author}"
+            )
+
+        last_status_time = 0
+        status_interval = 2.0
+        MAX_FLOOD_RETRIES = 10
+
+        # Iterate ID ranges in batches
+        current_id = start_id
+        while current_id <= end_id:
+            # Check cancellation
+            if cancel_event and cancel_event.is_set():
+                result["cancelled"] = True
+                break
+
+            # Ensure connected
+            if not await self._ensure_connected():
+                if status_callback:
+                    await status_callback("❌ Connection lost. Stopping.")
+                result["failed_count"] = -1
+                return result
+
+            # Build batch of IDs
+            batch_end = min(current_id + batch_size - 1, end_id)
+            msg_ids = list(range(current_id, batch_end + 1))
+            result["total_seen"] += len(msg_ids)
+
+            # Forward this batch with FloodWait retry
+            for attempt in range(MAX_FLOOD_RETRIES):
+                if cancel_event and cancel_event.is_set():
+                    break
+                try:
+                    await self.client.forward_messages(
+                        dest_entity,
+                        msg_ids,
+                        from_peer=source_entity,
+                        drop_author=drop_author,
+                    )
+                    result["sent_count"] += len(msg_ids)
+                    result["last_message_id"] = batch_end
+                    break
+                except MessageIdInvalidError:
+                    # Some IDs in this range don't exist (deleted messages).
+                    # Bisect: try first half, then second half.
+                    if len(msg_ids) <= 1:
+                        result["failed_count"] += 1
+                        break
+                    mid = len(msg_ids) // 2
+                    for half in (msg_ids[:mid], msg_ids[mid:]):
+                        if cancel_event and cancel_event.is_set():
+                            break
+                        try:
+                            await self.client.forward_messages(
+                                dest_entity, half, from_peer=source_entity,
+                                drop_author=drop_author,
+                            )
+                            result["sent_count"] += len(half)
+                            result["last_message_id"] = half[-1]
+                        except MessageIdInvalidError:
+                            if len(half) <= 1:
+                                result["failed_count"] += 1
+                            else:
+                                # Recursive bisection (simplified — just split once more)
+                                sub_mid = len(half) // 2
+                                for sub_half in (half[:sub_mid], half[sub_mid:]):
+                                    try:
+                                        await self.client.forward_messages(
+                                            dest_entity, sub_half, from_peer=source_entity,
+                                            drop_author=drop_author,
+                                        )
+                                        result["sent_count"] += len(sub_half)
+                                        result["last_message_id"] = sub_half[-1]
+                                    except Exception:
+                                        result["failed_count"] += len(sub_half)
+                        except FloodWaitError as e:
+                            result["flood_waits"] += 1
+                            wait = e.seconds + 2
+                            if status_callback:
+                                await status_callback(
+                                    f"⏳ FloodWait {wait}s on forward (bisect, attempt {attempt+1})"
+                                )
+                            end_wait = _time.time() + wait
+                            while _time.time() < end_wait:
+                                if cancel_event and cancel_event.is_set():
+                                    break
+                                await _asyncio.sleep(min(5, end_wait - _time.time()))
+                        except Exception as e:
+                            logger.warning("forward batch (bisect) failed: %s", e)
+                            result["failed_count"] += len(half)
+                    break  # done with bisection
+                except FloodWaitError as e:
+                    result["flood_waits"] += 1
+                    wait = e.seconds + 2
+                    if status_callback:
+                        await status_callback(
+                            f"⏳ FloodWait: sleeping {wait}s "
+                            f"(attempt {attempt+1}/{MAX_FLOOD_RETRIES})...\n"
+                            f"   Sent so far: {result['sent_count']}"
+                        )
+                    end_wait = _time.time() + wait
+                    while _time.time() < end_wait:
+                        if cancel_event and cancel_event.is_set():
+                            break
+                        await _asyncio.sleep(min(5, end_wait - _time.time()))
+                    if cancel_event and cancel_event.is_set():
+                        break
+                    continue  # retry same batch
+                except ConnectionError as e:
+                    logger.warning("connection dropped during forward: %s", e)
+                    if status_callback:
+                        await status_callback("⚠️ Connection dropped. Reconnecting...")
+                    await _asyncio.sleep(2)
+                    if not await self._ensure_connected():
+                        result["failed_count"] = -1
+                        return result
+                    continue
+                except _asyncio.CancelledError:
+                    result["cancelled"] = True
+                    break
+                except Exception as e:
+                    logger.warning("forward batch failed: %s", e)
+                    result["failed_count"] += len(msg_ids)
+                    break
+            else:
+                # Exhausted retries
+                if status_callback:
+                    await status_callback(
+                        f"❌ Exhausted {MAX_FLOOD_RETRIES} flood retries. Stopping."
+                    )
+                result["failed_count"] = -1
+                return result
+
+            if result["cancelled"]:
+                break
+
+            # Stats callback
+            if stats_callback:
+                try:
+                    await stats_callback(result)
+                except Exception:
+                    pass
+
+            # Periodic status update
+            now = _time.time()
+            if status_callback and now - last_status_time > status_interval:
+                last_status_time = now
+                elapsed = now - result["started_at"]
+                throughput = result["sent_count"] / (elapsed / 60) if elapsed > 1 else 0
+                pct = (result["sent_count"] / result["total_seen"] * 100) if result["total_seen"] > 0 else 0
+                await status_callback(
+                    f"📊 ID-based forward in progress...\n\n"
+                    f"Current ID: {batch_end} / {end_id}\n"
+                    f"Sent: {result['sent_count']}\n"
+                    f"Failed: {result['failed_count']}\n"
+                    f"Flood waits: {result['flood_waits']}\n"
+                    f"Progress: {pct:.1f}%\n"
+                    f"Speed: {throughput:.0f} items/min\n"
+                    f"Elapsed: {elapsed:.0f}s"
+                )
+
+            current_id = batch_end + 1
+
+            # Delay between batches (in 1s chunks for cancellation)
+            if current_id <= end_id:
+                for _ in range(int(batch_delay)):
+                    if cancel_event and cancel_event.is_set():
+                        result["cancelled"] = True
+                        break
+                    await _asyncio.sleep(1)
+
+        # Final status
+        if status_callback:
+            if result["cancelled"]:
+                await status_callback(
+                    f"🛑 Forward cancelled.\n\n"
+                    f"Sent: {result['sent_count']}\n"
+                    f"Failed: {result['failed_count']}\n"
+                    f"Last ID: {result['last_message_id']}"
+                )
+            else:
+                await status_callback(
+                    f"✅ Forward complete!\n\n"
+                    f"Total IDs: {result['total_seen']}\n"
+                    f"Sent: {result['sent_count']}\n"
+                    f"Failed: {result['failed_count']}\n"
+                    f"Flood waits: {result['flood_waits']}\n"
+                    f"Last ID: {result['last_message_id']}"
+                )
+
+        return result
+
 
 __all__ = [
     "UserSession",
