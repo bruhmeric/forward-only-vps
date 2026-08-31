@@ -2007,6 +2007,7 @@ class UserSession:
         status_callback=None,
         stats_callback=None,
         drop_author: bool = True,
+        drop_media_captions: bool = False,
         batch_size: int = 100,
         batch_delay: float = 1.5,
     ) -> dict:
@@ -2028,6 +2029,7 @@ class UserSession:
           status_callback: async callable(status_text)
           stats_callback: async callable(result_dict)
           drop_author: if True, strips "Forwarded from" header
+          drop_media_captions: if True, strips ALL captions from media
           batch_size: messages per forwardMessages call (max 100)
           batch_delay: seconds between batches (1.5s is safe for send limits)
 
@@ -2136,6 +2138,7 @@ class UserSession:
                         msg_ids,
                         from_peer=source_entity,
                         drop_author=drop_author,
+                        drop_media_captions=drop_media_captions,
                     )
                     result["sent_count"] += len(msg_ids)
                     result["last_message_id"] = batch_end
@@ -2154,6 +2157,7 @@ class UserSession:
                             await self.client.forward_messages(
                                 dest_entity, half, from_peer=source_entity,
                                 drop_author=drop_author,
+                                drop_media_captions=drop_media_captions,
                             )
                             result["sent_count"] += len(half)
                             result["last_message_id"] = half[-1]
@@ -2168,6 +2172,7 @@ class UserSession:
                                         await self.client.forward_messages(
                                             dest_entity, sub_half, from_peer=source_entity,
                                             drop_author=drop_author,
+                                            drop_media_captions=drop_media_captions,
                                         )
                                         result["sent_count"] += len(sub_half)
                                         result["last_message_id"] = sub_half[-1]

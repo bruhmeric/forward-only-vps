@@ -1466,6 +1466,8 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
       /scrapeid <url> 1 5000             — forward IDs 1 to 5000
       /scrapeid <url> 1000 2000 saved    — forward IDs 1000-2000 to Saved Messages
       /scrapeid <url> 1 5000 keep        — keep "Forwarded from" header
+      /scrapeid <url> 1 5000 strip       — strip ALL captions from media
+      /scrapeid <url> 1 5000 keep strip  — keep header AND strip captions
 
     This is the RECOMMENDED method for large public channels because:
     - Uses forward_messages(ids, from_peer) — no getHistory API calls
@@ -1473,6 +1475,11 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     - 100 messages per API call
     - No ~1800-message FloodWait cliff
     - Works for channels with 50k+ messages
+
+    Flags:
+      saved  — send to Saved Messages instead of destination group
+      keep   — keep "Forwarded from" header (default: strip)
+      strip  — strip ALL captions from media (default: keep captions)
 
     For protected channels (content protection enabled), use /scrape instead.
     """
@@ -1526,11 +1533,12 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     raw_flags = [a.lower() for a in context.args[1:]]
     send_to_saved = "saved" in raw_flags
     keep_author = "keep" in raw_flags
+    strip_captions = "strip" in raw_flags
 
     # Parse start_id and end_id
     start_id = 1
     end_id = 0  # 0 = auto-detect
-    id_args = [a for a in raw_flags if a not in ("saved", "keep")]
+    id_args = [a for a in raw_flags if a not in ("saved", "keep", "strip")]
     if len(id_args) >= 1:
         try:
             start_id = int(id_args[0])
@@ -1588,7 +1596,8 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"Source: `{parsed.chat_ref}`\n"
         f"Destination: {dest_label}\n"
         f"ID range: {range_str}\n"
-        f"Keep author: {keep_author}\n\n"
+        f"Keep author: {keep_author}\n"
+        f"Strip captions: {strip_captions}\n\n"
         f"_Uses forward_messages by ID — no getHistory rate limits._\n"
         f"_Send /stop_scrape to cancel._",
         parse_mode="Markdown",
@@ -1647,6 +1656,7 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 status_callback=status_callback,
                 stats_callback=stats_callback,
                 drop_author=not keep_author,
+                drop_media_captions=strip_captions,
             )
             # Update cumulative stats
             db = context.bot_data.get("db")

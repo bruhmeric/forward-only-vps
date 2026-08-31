@@ -7,10 +7,16 @@ Run the **Telegram Forwarder Bot** + a **web dashboard** on a single VPS using D
 - Forward any media you send to a destination group/topic
 - Pull content from locked private channels via t.me links
 - Auto-scrape entire channels (`/scrape`)
+- **Bulk-forward by ID range** (`/scrapeid`) — no rate limits, works on 50k+ message channels
 - Send directly to Saved Messages (`/saved`)
 - Custom captions (`/caption`)
 - Media type filters (`/scrape <url> photo video`)
+- Strip captions / keep "Forwarded from" header
+- Convert GIFs/animations to regular video files
+- Auto-reconnect on connection drops
 - Real-time progress with live stats dashboard
+- All-time cumulative statistics (persisted across restarts)
+- 3-tier force-stop (`/stop_scrape` always works, even when stuck)
 
 ---
 
@@ -138,7 +144,7 @@ http://YOUR_VPS_IP:8080
 The dashboard shows:
 
 - **All-Time Statistics**: Total scrapes, total sent, total failed, total skipped, flood waits, saved forwards
-- **Live Scrape**: Real-time progress with progress bar, sent/failed/skipped counts, in-flight count, speed (items/min), elapsed time
+- **Live Scrape**: Real-time progress with progress bar, sent/failed/skipped counts, in-flight count, speed (items/min), elapsed time, ETA
 - **Bot Configuration**: Bot name, mode, destination, forum status, caption mode
 - **Controls**: Stop scrape, clear caption, reset stats
 
@@ -156,16 +162,28 @@ Send these to the bot on Telegram:
 | `/help` | Show all commands |
 | `/setgroup <id>` | Set destination group/channel |
 | `/saved <url>` | Send t.me link content to Saved Messages |
-| `/scrape <url> [flags]` | Scrape ALL media from a channel |
-| `/stop_scrape` | Stop the active scrape |
+| `/scrape <url> [flags]` | Scrape ALL media from a channel (uses getHistory) |
+| `/scrapeid <url> [start] [end] [flags]` | **Bulk-forward by ID range** — no rate limits |
+| `/stop_scrape` | Stop the active scrape (3-tier force-stop, always works) |
 | `/scrape_status` | Check scrape progress |
 | `/caption <text>` | Set custom caption for all forwards |
 | `/caption strip` | Strip ALL captions from forwarded media |
 | `/caption clear` | Restore original captions |
+| `/reconnect` | Retry Telethon connection (if session failed at boot) |
 | `/status` | Show bot status |
 | `/info` | Show destination chat info |
+| `/whoami` | Show your Telegram user ID + admin status |
+| `/test_link <url>` | Diagnostic: test fetching a t.me link |
 
-### Scrape Flags
+---
+
+## `/scrape` vs `/scrapeid` — Which to Use?
+
+### `/scrape` — History-Based Scraping
+
+Uses `getHistory` API to read messages, then forwards them. Supports media filters and custom captions.
+
+**Best for:** Small channels (<1000 messages), protected channels, or when you need media type filters.
 
 | Flag | Effect |
 |---|---|
@@ -180,6 +198,117 @@ Send these to the bot on Telegram:
 /scrape https://t.me/c/1234567890 saved old
 /scrape https://t.me/c/1234567890 photo video parallel=8
 ```
+
+**⚠️ Limitation:** Fails after ~1800 messages due to getHistory rate limits (30s per 10 requests). For large channels, use `/scrapeid` instead.
+
+---
+
+### `/scrapeid` — ID-Based Bulk Forwarding (Recommended for Large Channels)
+
+Uses `forward_messages(ids, from_peer)` which takes message IDs directly — **no getHistory needed**. Uses the SEND rate-limit bucket (different from getHistory), so it can handle 50k+ messages without rate limits.
+
+**Best for:** Large public channels (1000+ messages), bulk-forwarding everything.
+
+| Flag | Effect |
+|---|---|
+| `saved` | Send to Saved Messages. Default: destination group. |
+| `keep` | Keep "Forwarded from" header. Default: strip. |
+| `strip` | Strip ALL captions from media. Default: keep captions. |
+
+**Usage:**
+```
+/scrapeid <url>                          # Forward ALL messages (auto-detect range)
+/scrapeid <url> 1 5000                   # Forward IDs 1 to 5000
+/scrapeid <url> 1000 2000 saved          # Forward IDs 1000-2000 to Saved Messages
+/scrapeid <url> 1 5000 keep              # Keep "Forwarded from" header
+/scrapeid <url> 1 5000 strip             # Strip ALL captions
+/scrapeid <url> 1 5000 keep strip        # Keep header + strip captions
+/scrapeid <url> saved strip              # Forward all to Saved Messages, strip captions
+```
+
+**Caption behavior:**
+| Flags | "Forwarded from" header | Captions |
+|---|---|---|
+| *(none — default)* | Stripped | Kept |
+| `keep` | Kept | Kept |
+| `strip` | Stripped | Stripped |
+| `keep strip` | Kept | Stripped |
+
+**Why `/scrapeid` is faster:**
+- 100 messages per API call (vs 1 per call with getHistory)
+- Uses `forwardMessages` (send bucket, ~30/sec) instead of `getHistory` (read bucket, ~10/30s)
+- ~4000 messages/minute throughput
+- No ~1800-message FloodWait cliff
+
+**Limitations:**
+- Can't filter by media type (forwards everything)
+- Can't apply custom captions (use `strip` flag instead)
+- Doesn't work on protected channels (use `/scrape` for those)
+
+---
+
+## Caption Control
+
+### Via `/caption` command (affects `/scrape` and `/saved`)
+
+```
+/caption <text>      — set custom caption (replaces original on all forwards)
+/caption strip       — strip ALL captions (forward media without any text)
+/caption clear       — restore original caption behavior
+/caption             — show current setting
+```
+
+### Via `/scrapeid` flags (per-scrape control)
+
+```
+/scrapeid <url>                    — default (keep captions, strip header)
+/scrapeid <url> strip              — strip captions
+/scrapeid <url> keep               — keep "Forwarded from" header
+/scrapeid <url> keep strip         — keep header, strip captions
+```
+
+---
+
+## GIF/Animation Handling
+
+All videos (including GIFs/animations) are sent as **regular video files** with playback controls — not as looping GIF animations. This applies to both `/scrape` and `/scrapeid`.
+
+The bot strips the `DocumentAttributeAnimated` flag from GIFs and adds `DocumentAttributeVideo` with `supports_streaming=True`, so:
+- Short videos appear as videos (not GIFs)
+- Playback controls are available (play/pause/seek)
+- Videos are streamable
+- Original thumbnails are preserved
+
+---
+
+## Auto-Reconnect
+
+The bot automatically handles connection drops:
+
+- **Telethon client:** `auto_reconnect=True`, `connection_retries=10`, `retry_delay=2`, `request_retries=5`
+- **`_ensure_connected()`:** Called before every command — reconnects if disconnected
+- **`/reconnect` command:** Manually retry the Telethon connection without restarting the bot
+- **During scrape:** Connection drops trigger auto-reconnect with resume from last message ID
+
+---
+
+## `/stop_scrape` — 3-Tier Force Stop
+
+The `/stop_scrape` command always works, even when the scrape is stuck:
+
+1. **Tier 1 (graceful):** Set the cancel event, wait up to 10 seconds
+2. **Tier 2 (forceful):** Call `task.cancel()` — schedules `CancelledError` at the next await checkpoint
+3. **Tier 3 (nuclear):** Disconnect the Telethon client — tears down blocked socket reads, then reconnects
+
+This guarantees the scrape stops even when stuck in a C-level blocking I/O call.
+
+---
+
+## File Size Support
+
+- Supports files up to **2GB** (Telegram's hard limit)
+- Uses `InputFileBig` for files >10MB (parallel chunked upload with 4 concurrent chunks)
+- No 50MB limit (removed the old Bot API cap)
 
 ---
 
@@ -215,7 +344,9 @@ docker-compose up -d --build
 
 ## Performance Tuning
 
-The bot's scraping speed is controlled by the `PARALLEL` environment variable (default: 5):
+### `/scrape` speed (PARALLEL env var)
+
+The `/scrape` command's speed is controlled by the `PARALLEL` environment variable (default: 5):
 
 | PARALLEL | Speed | FloodWait Risk |
 |---|---|---|
@@ -229,7 +360,27 @@ Set it in `.env`:
 PARALLEL=8
 ```
 
-The bot automatically handles FloodWait errors by sleeping the requested duration and retrying.
+### `/scrapeid` speed
+
+`/scrapeid` is already optimized — no tuning needed:
+- 100 messages per API call (Telegram's max)
+- 1.5s delay between batches (safe for send limits)
+- ~4000 messages/minute throughput
+
+---
+
+## All-Time Statistics
+
+The bot tracks cumulative stats that persist across restarts (stored in SQLite):
+
+- Total scrapes run
+- Total messages sent
+- Total messages failed
+- Total messages skipped
+- Total flood waits
+- Total saved forwards
+
+View them in the dashboard at `http://YOUR_VPS_IP:8080`, or reset them with the "Reset All Stats" button.
 
 ---
 
@@ -241,16 +392,17 @@ telegram-forwarder-vps/
 │   ├── bot.py                    # Main entry + /stats endpoint for dashboard
 │   ├── config.py                 # Env loader (includes PARALLEL)
 │   ├── db.py                     # SQLite layer (includes cumulative stats)
-│   ├── user_session.py           # Telethon manager + scrape_channel
+│   ├── user_session.py           # Telethon manager + scrape_channel + scrape_channel_by_ids
 │   ├── topics.py                 # Forum topic discovery
 │   ├── login.py                  # One-time Telethon login
 │   ├── handlers/
 │   │   ├── __init__.py
-│   │   ├── admin.py              # /scrape, /saved, /caption, etc.
+│   │   ├── admin.py              # /scrape, /scrapeid, /saved, /caption, /reconnect, etc.
 │   │   ├── direct.py             # Direct forward + batch window
 │   │   └── link.py              # Locked-channel URL → fetch + forward
 │   ├── requirements.txt
 │   ├── Dockerfile
+│   ├── .env.example
 │   └── .env                      # ← you fill this in
 │
 ├── dashboard/                    # Web Dashboard
@@ -271,6 +423,22 @@ telegram-forwarder-vps/
 - Check `ADMIN_IDS` — if set, only listed users can use the bot. Send `/whoami` to see your user ID.
 - Check logs: `docker-compose logs forwarder-bot`
 - Verify `SESSION_STRING` is valid (not expired/revoked)
+- Send `/reconnect` to retry the Telethon connection
+
+### "Telethon session failed to start at boot"
+
+1. Check logs: `docker-compose logs forwarder-bot | grep Telethon`
+2. Look for:
+   - `Config check: API_ID=MISSING` → your `.env` doesn't have API_ID
+   - `Config check: SESSION_STRING=MISSING` → your `.env` doesn't have SESSION_STRING
+   - `Telethon: session exists but is NOT authorized` → SESSION_STRING is invalid/revoked
+3. Send `/reconnect` to retry, or regenerate SESSION_STRING:
+   ```bash
+   # On your laptop:
+   python login.py --string
+   # Update SESSION_STRING in .env on the VPS, then:
+   docker-compose restart forwarder-bot
+   ```
 
 ### Dashboard shows bot as offline
 
@@ -278,17 +446,56 @@ telegram-forwarder-vps/
 - Check logs: `docker-compose logs forwarder-bot`
 - The dashboard queries internal Docker DNS (`forwarder-bot`) — this only works when both containers are on the same `bots-network`
 
+### `/scrape` fails after ~1800 messages
+
+This is a known Telegram rate limit on `getHistory` (30s per 10 requests). **Use `/scrapeid` instead** — it uses `forwardMessages` which has a different rate-limit bucket and doesn't hit this limit:
+
+```
+# Instead of:
+/scrape https://t.me/bigchannel
+
+# Use:
+/scrapeid https://t.me/bigchannel
+```
+
+### `/stop_scrape` doesn't work
+
+The 3-tier force-stop should always work. If it doesn't:
+1. Wait 10 seconds (Tier 1: graceful stop)
+2. The bot will try `task.cancel()` (Tier 2)
+3. If still stuck, the bot will disconnect Telethon (Tier 3)
+4. As a last resort: `docker-compose restart forwarder-bot`
+
 ### Scrape is slow
 
-- Increase `PARALLEL` in `.env` (default: 5, max: 10)
+- For `/scrape`: Increase `PARALLEL` in `.env` (default: 5, max: 10)
+- For large channels: Use `/scrapeid` instead (much faster, no rate limits)
 - If you hit FloodWait often, lower the parallel count
-- For huge channels, scraping will take time at any rate
 
 ### Firewall
 
 ```bash
 sudo ufw allow 8080/tcp    # Dashboard
 ```
+
+---
+
+## Quick Reference
+
+| Task | Command |
+|---|---|
+| Forward entire large channel | `/scrapeid https://t.me/channel` |
+| Forward specific ID range | `/scrapeid https://t.me/channel 1 5000` |
+| Forward to Saved Messages | `/scrapeid https://t.me/channel saved` |
+| Strip captions | `/scrapeid https://t.me/channel strip` |
+| Keep "Forwarded from" | `/scrapeid https://t.me/channel keep` |
+| Small channel with filters | `/scrape https://t.me/channel photo video` |
+| Protected channel | `/scrape https://t.me/c/123 saved` |
+| Stop any scrape | `/stop_scrape` |
+| Check progress | `/scrape_status` |
+| Reconnect Telethon | `/reconnect` |
+| Set custom caption | `/caption Check out this content!` |
+| View dashboard | `http://YOUR_VPS_IP:8080` |
 
 ---
 
