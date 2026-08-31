@@ -1251,7 +1251,14 @@ async def cmd_caption(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def cmd_stop_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Stop the currently running scrape."""
+    """Stop the currently running scrape.
+
+    Uses a two-tier approach:
+    1. Set the cancel_event (graceful — scrape stops at next check point)
+    2. If the scrape doesn't stop within 10 seconds, forcefully cancel the task
+    This ensures /stop_scrape ALWAYS works, even when the scrape is stuck
+    in an error loop or a long FloodWait.
+    """
     cfg = context.bot_data["config"]
     if not cfg.is_admin(update.effective_user.id):
         return
@@ -1260,13 +1267,44 @@ async def cmd_stop_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not task or task.done():
         await update.effective_message.reply_text("No active scrape to stop.")
         return
-    # Set the cancel event — the scrape loop will pick it up on next iteration
+
+    # Tier 1: Set the cancel event (graceful stop)
     if cancel_event:
         cancel_event.set()
-    await update.effective_message.reply_text(
-        "🛑 Stop signal sent. The scrape will stop after the current message "
-        "(within a few seconds). Use /scrape_status to see final stats."
+
+    status_msg = await update.effective_message.reply_text(
+        "🛑 Stop signal sent. Waiting for graceful stop (up to 10s)..."
     )
+
+    # Wait up to 10 seconds for graceful stop
+    import asyncio as _asyncio
+    stopped_gracefully = False
+    for _ in range(10):
+        await _asyncio.sleep(1)
+        if task.done():
+            stopped_gracefully = True
+            break
+
+    if not stopped_gracefully:
+        # Tier 2: Force cancel the task
+        try:
+            task.cancel()
+            await _asyncio.sleep(1)
+            await status_msg.edit_text(
+                "🛑 Scrape force-stopped (didn't respond to graceful cancel within 10s).\n"
+                "Use /scrape_status to see final stats."
+            )
+        except Exception as e:
+            await status_msg.edit_text(
+                f"🛑 Stop signal sent but scrape may still be running.\n"
+                f"Force cancel error: {type(e).__name__}: {e}\n"
+                f"Try: docker-compose restart forwarder-bot"
+            )
+    else:
+        await status_msg.edit_text(
+            "✅ Scrape stopped gracefully.\n"
+            "Use /scrape_status to see final stats."
+        )
 
 
 async def cmd_scrape_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

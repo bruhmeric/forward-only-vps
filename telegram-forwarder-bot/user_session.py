@@ -574,38 +574,34 @@ class UserSession:
 
     async def send_to_destination(
         self,
-        source_chat_id: int,
+        source_chat_id,
         source_message_ids: list[int],
-        dest_chat_id: int,
+        dest_chat_id,
         topic_id: int | None = None,
         progress_callback=None,
         custom_caption: str | None = None,
+        source_messages: list | None = None,
     ) -> tuple[bool, list[str]]:
         """Send message(s) from a source chat to the destination chat using
         the user account (Telethon). This is the NEW fast path that avoids
         downloading media to disk and re-uploading via Bot API.
 
-        Strategy (per the user's research on hybrid bot patterns):
-          1. Try `user_client.forward_messages(dest, source_msg_ids, source_chat)`
-             — this is the TRUE Telegram forward, fastest, preserves original
-             sender info, and works for albums natively.
-          2. If forward_messages fails (because the source has noforwards
-             restriction), fall back to `user_client.send_message(dest,
-             file=msg.media, formatting_entities=msg.entities)` for each
-             message — this re-uploads from Telegram's servers WITHOUT
-             downloading to disk. For protected albums, items are sent
-             individually (loses album grouping in destination, but works).
-          3. NEW: if (2) also fails (fully-protected content), download to
-             disk + send_file(file=path) — uploads as a brand-new file with
-             no link to the protected source. We PRESERVE the original
-             document attributes (DocumentAttributeVideo, duration, dims,
-             supports_streaming) and mime_type so the file is sent as a
-             PLAYABLE VIDEO (not a generic document).
-
         Args:
+          source_chat_id: source chat_id (int) or resolved entity (cached)
+          source_message_ids: list of message IDs to send
+          dest_chat_id: destination chat_id (int) or resolved entity (cached)
+          topic_id: optional topic thread (for forum destinations)
           progress_callback: optional callable(sent_bytes, total_bytes) called
-            during downloads and uploads so the caller can show progress.
-            Currently used by the third (download+upload) path only.
+            during downloads and uploads.
+          custom_caption: None=original, ""=strip, "<text>"=custom
+          source_messages: OPTIONAL — list of pre-fetched Telethon Message
+            objects. If provided, skips the get_messages() API call (major
+            optimization for scrape_channel which already has the messages).
+
+        Strategy:
+          1. Try `user_client.forward_messages(dest, source_msg_ids, source_chat)`
+          2. If that fails, fall back to `send_message(file=msg.media)` per msg
+          3. If that also fails, download to disk + `send_file(file=path)`
 
         Requirements:
           - The user account must be a member of BOTH source and destination
@@ -645,30 +641,52 @@ class UserSession:
             # Strip formatting entities when using custom caption
             return None
 
+        # ── Use cached entities if provided (avoids _resolve_entity API calls) ──
+        # scrape_channel passes already-resolved entities for massive speedup.
+        # If source_chat_id/dest_chat_id are already entity objects, use them
+        # directly instead of calling _resolve_entity.
         try:
-            source_entity = await self._resolve_entity(source_chat_id, diag)
-            dest_entity = await self._resolve_entity(dest_chat_id, diag)
-            diag.append(f"✓ Resolved source ({type(source_entity).__name__}) and "
-                        f"destination ({type(dest_entity).__name__})")
+            # Check if source_chat_id is already an entity object (not int/str)
+            if hasattr(source_chat_id, 'id') or hasattr(source_chat_id, 'channel_id'):
+                source_entity = source_chat_id
+                diag.append(f"✓ Using cached source entity ({type(source_entity).__name__})")
+            else:
+                source_entity = await self._resolve_entity(source_chat_id, diag)
+                diag.append(f"✓ Resolved source ({type(source_entity).__name__})")
+
+            if hasattr(dest_chat_id, 'id') or hasattr(dest_chat_id, 'channel_id'):
+                dest_entity = dest_chat_id
+                diag.append(f"✓ Using cached dest entity ({type(dest_entity).__name__})")
+            else:
+                dest_entity = await self._resolve_entity(dest_chat_id, diag)
+                diag.append(f"✓ Resolved dest ({type(dest_entity).__name__})")
         except Exception as e:
             diag.append(f"✗ Failed to resolve entities: {type(e).__name__}: {e}")
             return False, diag
 
-        # Fetch the messages first so we have them ready (also confirms access)
-        try:
-            messages = await self.client.get_messages(source_entity, ids=source_message_ids)
-            # Telethon returns None for missing messages; filter those out
-            if isinstance(messages, list):
-                messages = [m for m in messages if m is not None]
-            else:
-                messages = [messages] if messages else []
+        # ── Use pre-fetched messages if provided (avoids get_messages API call) ──
+        # scrape_channel passes the msg objects directly — major optimization
+        # for massive channels (saves 1 API call per message).
+        if source_messages:
+            messages = [m for m in source_messages if m is not None]
             if not messages:
-                diag.append(f"✗ No messages found with IDs {source_message_ids}")
+                diag.append(f"✗ No valid messages in source_messages")
                 return False, diag
-            diag.append(f"✓ Fetched {len(messages)} message(s) from source")
-        except Exception as e:
-            diag.append(f"✗ Failed to fetch messages: {type(e).__name__}: {e}")
-            return False, diag
+            diag.append(f"✓ Using {len(messages)} pre-fetched message(s)")
+        else:
+            try:
+                messages = await self.client.get_messages(source_entity, ids=source_message_ids)
+                if isinstance(messages, list):
+                    messages = [m for m in messages if m is not None]
+                else:
+                    messages = [messages] if messages else []
+                if not messages:
+                    diag.append(f"✗ No messages found with IDs {source_message_ids}")
+                    return False, diag
+                diag.append(f"✓ Fetched {len(messages)} message(s) from source")
+            except Exception as e:
+                diag.append(f"✗ Failed to fetch messages: {type(e).__name__}: {e}")
+                return False, diag
 
         # ---- Step 1: try true forward (works for non-protected content) ----
         # Skip this step if a custom_caption is set — forward_messages doesn't
@@ -707,9 +725,66 @@ class UserSession:
         last_error = None
         for i, msg in enumerate(messages):
             try:
+                # ── Strip DocumentAttributeAnimated from the media ──────────
+                # This ensures GIFs/animations are sent as regular videos,
+                # not as looping GIF animations. We deep-copy the media
+                # object and remove the Animated attribute from the document.
+                media_to_send = msg.media
+                try:
+                    from telethon.tl import types as _tl_types
+                    if isinstance(msg.media, _tl_types.MessageMediaDocument) and msg.media.document:
+                        doc = msg.media.document
+                        # Check if it has DocumentAttributeAnimated
+                        has_animated = any(
+                            isinstance(a, _tl_types.DocumentAttributeAnimated)
+                            for a in (doc.attributes or [])
+                        )
+                        if has_animated:
+                            # Rebuild the document without DocumentAttributeAnimated
+                            new_attrs = [
+                                a for a in (doc.attributes or [])
+                                if not isinstance(a, _tl_types.DocumentAttributeAnimated)
+                            ]
+                            # Make sure there's still a DocumentAttributeVideo
+                            # so Telegram knows it's a video
+                            has_video_attr = any(
+                                isinstance(a, _tl_types.DocumentAttributeVideo)
+                                for a in new_attrs
+                            )
+                            if not has_video_attr:
+                                new_attrs.append(
+                                    _tl_types.DocumentAttributeVideo(
+                                        duration=0, w=0, h=0,
+                                        supports_streaming=True,
+                                    )
+                                )
+                            # Create a new Document with the modified attributes
+                            # (Documents are immutable in Telethon, so we make a copy)
+                            new_doc = _tl_types.Document(
+                                id=doc.id,
+                                access_hash=doc.access_hash,
+                                file_reference=doc.file_reference,
+                                date=doc.date,
+                                mime_type=doc.mime_type,
+                                size=doc.size,
+                                thumbs=doc.thumbs,
+                                dc_id=doc.dc_id,
+                                attributes=new_attrs,
+                                version=getattr(doc, 'version', 0),
+                            )
+                            media_to_send = _tl_types.MessageMediaDocument(
+                                document=new_doc,
+                                ttl_seconds=getattr(msg.media, 'ttl_seconds', None),
+                            )
+                            diag.append(f"  • Stripped GIF/animation flag from msg {i+1} — sending as video")
+                except Exception as e:
+                    # If the deep-copy fails, fall back to the original media
+                    # (it will be sent as a GIF, which is not ideal but works)
+                    logger.debug("Failed to strip DocumentAttributeAnimated: %s", e)
+
                 send_kwargs = dict(
                     message=_caption_for(msg, i),
-                    file=msg.media,
+                    file=media_to_send,
                     formatting_entities=_formatting_entities_for(msg, i),
                     link_preview=False,
                 )
@@ -938,14 +1013,43 @@ class UserSession:
                     #
                     # We filter out DocumentAttributeFilename to avoid the
                     # conflict; Telethon will use the local file's basename.
+                    #
+                    # NEW: We ALSO strip DocumentAttributeAnimated so that
+                    # GIFs/animations are sent as regular VIDEOS, not as
+                    # looping GIF animations. This ensures every video
+                    # (even short ones) appears as a video file with
+                    # playback controls, not as a GIF.
                     original_attributes = [
                         attr for attr in (doc.attributes or [])
                         if not isinstance(attr, tl_types.DocumentAttributeFilename)
+                        and not isinstance(attr, tl_types.DocumentAttributeAnimated)
                     ]
 
+                    # If the source was an animation (GIF), we stripped
+                    # DocumentAttributeAnimated above. Now we need to make
+                    # sure there's still a DocumentAttributeVideo so Telegram
+                    # treats it as a video. If there isn't one, add a minimal
+                    # one with supports_streaming=True.
+                    if is_animation and is_video:
+                        has_video_attr = any(
+                            isinstance(a, tl_types.DocumentAttributeVideo)
+                            for a in original_attributes
+                        )
+                        if not has_video_attr:
+                            # Add a minimal DocumentAttributeVideo so Telegram
+                            # knows this is a video file (not a document)
+                            original_attributes.append(
+                                tl_types.DocumentAttributeVideo(
+                                    duration=0,  # unknown duration
+                                    w=0, h=0,  # unknown dimensions
+                                    supports_streaming=True,
+                                )
+                            )
+
                     # Decide force_document — True for generic files (pdf, zip)
-                    force_document = not (is_video or is_audio or
-                                          is_animation or is_image_doc)
+                    # Note: is_animation is now irrelevant because we stripped
+                    # the Animated attribute — the file will be sent as a video.
+                    force_document = not (is_video or is_audio or is_image_doc)
 
                     # Download to disk with LARGER CHUNK SIZE for speed.
                     # Telethon's auto-picker uses 128KB for <100MB files,
@@ -1076,13 +1180,17 @@ class UserSession:
                         sent_count += 1
                         if is_video:
                             thumb_msg = " with thumbnail" if thumb_path else " (no thumbnail)"
+                            anim_msg = " (converted from GIF/animation)" if is_animation else ""
                             diag.append(f"✓ Sent re-uploaded video {i+1}/{len(messages)} "
                                         f"(playable, streaming{thumb_msg}, "
-                                        f"duration/dims preserved)")
+                                        f"duration/dims preserved{anim_msg})")
                         elif is_audio:
                             diag.append(f"✓ Sent re-uploaded audio {i+1}/{len(messages)}")
                         elif is_animation:
-                            diag.append(f"✓ Sent re-uploaded animation {i+1}/{len(messages)}")
+                            # This shouldn't happen anymore (animations are
+                            # converted to videos above), but keep the message
+                            # for backward compatibility.
+                            diag.append(f"✓ Sent re-uploaded animation {i+1}/{len(messages)} (as video)")
                         else:
                             diag.append(f"✓ Sent re-uploaded document {i+1}/{len(messages)}")
                     except Exception as e:
@@ -1408,9 +1516,19 @@ class UserSession:
           - Each task holds its own network connection (no shared TCP overhead)
           - The order of sent messages in the destination may differ from the
             source order when parallel > 1 (out-of-order arrival)
+
+        Optimization for massive channels (10k+ messages):
+          - Entities are resolved ONCE and cached (not per-message)
+          - Message objects from iter_messages are passed directly to
+            send_to_destination (avoids re-fetching via get_messages)
+          - pending_send_tasks is drained on EVERY iteration (no accumulation)
+          - Cancellation is checked at every yield point (even during errors)
+          - ConnectionError triggers auto-reconnect with resume from last msg ID
+          - Per-send timeout (10 min) prevents stuck sends from blocking forever
         """
         from telethon.errors import FloodWaitError
         import asyncio as _asyncio
+        import time as _time
 
         # Normalize media_types: lowercase, validate, default to None (all)
         if media_types is not None:
@@ -1430,22 +1548,26 @@ class UserSession:
         result = {
             "sent_count": 0,
             "failed_count": 0,
-            "skipped_count": 0,  # text-only or no-media messages
+            "skipped_count": 0,
             "total_seen": 0,
             "last_message_id": 0,
             "cancelled": False,
             "flood_waits": 0,
-            "in_flight": 0,       # number of sends currently in progress
-            "started_at": time.time(),  # for elapsed time calculation
+            "in_flight": 0,
+            "started_at": time.time(),
         }
 
+        # ── Resolve entities ONCE and cache them ──────────────────────────
+        # This is the #1 optimization for massive channels: the old code
+        # called _resolve_entity on EVERY send (2 API calls per message).
+        # For 10k messages, that's 20k unnecessary API calls → FloodWait.
         try:
             source_entity = await self._resolve_entity(source_chat_ref, None)
             dest_entity = await self._resolve_entity(dest_chat_id, None)
         except Exception as e:
             if status_callback:
                 await status_callback(f"❌ Failed to resolve entities: {type(e).__name__}: {e}")
-            result["failed_count"] = -1  # signal error
+            result["failed_count"] = -1
             return result
 
         if status_callback:
@@ -1459,21 +1581,18 @@ class UserSession:
         # Build kwargs for iter_messages
         iter_kwargs = {
             "reverse": reverse,
-            "limit": None,  # iterate ALL messages (use async iterator)
+            "limit": None,
         }
         if min_id > 0:
             iter_kwargs["min_id"] = min_id
         if max_id > 0:
             iter_kwargs["max_id"] = max_id
 
-        # Statistics for status updates
         last_status_time = 0
-        status_interval = 1.0  # update status every 1 second (was 5 — too slow for real-time feel)
+        status_interval = 1.0
 
         # Helper: classify a message's media type
         def _classify_media(msg) -> str | None:
-            """Return 'photo', 'video', 'animation', 'document', 'audio',
-            'voice', or None (for non-media messages)."""
             if not msg.media:
                 return None
             if isinstance(msg.media, tl.MessageMediaPhoto):
@@ -1488,7 +1607,6 @@ class UserSession:
                         if isinstance(attr, tl.DocumentAttributeAnimated):
                             return "animation"
                         if isinstance(attr, tl.DocumentAttributeVideo):
-                            # round_message=True means round video (video note)
                             return "video_note" if getattr(attr, "round_message", False) else "video"
                     return "video"
                 if mt.startswith("audio/"):
@@ -1497,32 +1615,33 @@ class UserSession:
                             return "voice"
                     return "audio" if "ogg" not in mt else "voice"
                 return "document"
-            # Non-downloadable types: web pages, contacts, geos, polls, etc.
             return None
 
-        # Helper: send one message with FloodWait handling
-        async def _send_one(msg_id: int):
-            """Send a single message via send_to_destination, with FloodWait
-            retry. Updates `result` in place. Returns True if sent.
+        # ── Send one message — NEVER raises, caches entities ───────────────
+        async def _send_one(msg):
+            """Send a single message. Passes the msg object directly to
+            send_to_destination to avoid re-fetching it via get_messages.
 
             NEVER raises — all exceptions are caught and counted as failures.
             This ensures one bad message doesn't stop the entire scrape."""
-            src_ref = source_chat_ref if isinstance(source_chat_ref, int) else source_entity.id
-            result["in_flight"] += 1  # track active sends for real-time status
+            result["in_flight"] += 1
             try:
-                # Use a timeout so a stuck send (e.g. network hang on a huge
-                # file) doesn't block the scrape forever. 10 min per file is
-                # generous — even a 2GB file at 5MB/s takes ~7 min.
+                # Check cancellation before sending
+                if cancel_event and cancel_event.is_set():
+                    return False
+
+                # Use a timeout so a stuck send doesn't block the scrape forever.
                 success, _ = await _asyncio.wait_for(
                     self.send_to_destination(
-                        source_chat_id=src_ref,
-                        source_message_ids=[msg_id],
-                        dest_chat_id=dest_chat_id,
+                        source_chat_id=source_entity,  # cached entity, not chat_ref
+                        source_message_ids=[msg.id],
+                        dest_chat_id=dest_entity,      # cached entity
                         topic_id=topic_id,
                         progress_callback=None,
                         custom_caption=custom_caption,
+                        source_messages=[msg],         # pass the msg directly!
                     ),
-                    timeout=600,  # 10 minutes per file max
+                    timeout=600,
                 )
                 if success:
                     result["sent_count"] += 1
@@ -1537,17 +1656,24 @@ class UserSession:
                         f"⏳ Flood wait: sleeping {wait_seconds}s before retrying...\n"
                         f"   Sent so far: {result['sent_count']}"
                     )
-                await _asyncio.sleep(wait_seconds)
+                # Sleep in chunks so we can be interrupted by cancel
+                end_wait = _time.time() + wait_seconds
+                while _time.time() < end_wait:
+                    if cancel_event and cancel_event.is_set():
+                        result["failed_count"] += 1
+                        return False
+                    await _asyncio.sleep(min(5, end_wait - _time.time()))
                 # Retry once
                 try:
                     success, _ = await _asyncio.wait_for(
                         self.send_to_destination(
-                            source_chat_id=src_ref,
-                            source_message_ids=[msg_id],
-                            dest_chat_id=dest_chat_id,
+                            source_chat_id=source_entity,
+                            source_message_ids=[msg.id],
+                            dest_chat_id=dest_entity,
                             topic_id=topic_id,
                             progress_callback=None,
                             custom_caption=custom_caption,
+                            source_messages=[msg],
                         ),
                         timeout=600,
                     )
@@ -1559,205 +1685,184 @@ class UserSession:
                 result["failed_count"] += 1
                 return False
             except _asyncio.TimeoutError:
-                logger.warning("scrape: send timed out for msg %d (10min limit)", msg_id)
+                logger.warning("scrape: send timed out for msg %d (10min limit)", msg.id)
                 result["failed_count"] += 1
                 return False
             except Exception as e:
-                logger.warning("scrape: failed to send msg %d: %s", msg_id, e)
+                logger.warning("scrape: failed to send msg %d: %s", msg.id, e)
                 result["failed_count"] += 1
                 return False
             finally:
                 result["in_flight"] -= 1
-                # Trigger a status update on every send completion — this is
-                # what makes the status message update in REAL TIME as each
-                # send finishes, not just every 2 seconds.
                 if stats_callback:
                     try:
                         await stats_callback(result)
                     except Exception:
                         pass
 
-        # Semaphore for parallel sends (limits concurrent in-flight sends)
-        # to avoid hitting Telegram's rate limit. Default 3 = ~9 msgs/sec total.
         sem = _asyncio.Semaphore(parallel)
-        pending_send_tasks: list = []  # asyncio tasks for in-flight sends
+        pending_send_tasks: list = []
 
-        async def _send_with_semaphore(msg_id: int):
-            """Wrap _send_one with the semaphore. Awaits the send."""
+        async def _send_with_semaphore(msg):
             async with sem:
-                # Check cancellation before sending
                 if cancel_event and cancel_event.is_set():
                     return False
-                await _send_one(msg_id)
-                # Small delay between sends within a single task slot
+                await _send_one(msg)
                 await _asyncio.sleep(0.3)
 
-        try:
-            async for msg in self.client.iter_messages(source_entity, **iter_kwargs):
-                # Check for cancellation
-                if cancel_event and cancel_event.is_set():
-                    result["cancelled"] = True
-                    # Wait for in-flight sends to complete (don't abandon them)
-                    if pending_send_tasks:
-                        if status_callback:
-                            await status_callback(
-                                f"🛑 Cancel signal received. Waiting for "
-                                f"{len(pending_send_tasks)} in-flight send(s) to complete..."
-                            )
-                        await _asyncio.gather(*pending_send_tasks, return_exceptions=True)
-                    if status_callback:
-                        await status_callback(
-                            f"🛑 Scraping cancelled by user.\n"
-                            f"   Sent: {result['sent_count']}, "
-                            f"Failed: {result['failed_count']}, "
-                            f"Skipped: {result['skipped_count']}"
-                        )
-                    break
-
-                result["total_seen"] += 1
-                result["last_message_id"] = msg.id
-
-                # Classify the message's media type
-                m_type = _classify_media(msg)
-
-                # Skip if no media
-                if m_type is None:
-                    result["skipped_count"] += 1
-                    continue
-
-                # Apply user's media type filter
-                if media_types is not None:
-                    # Normalize: 'voice' and 'video_note' both count as their
-                    # respective primary types. 'video_note' is treated as 'video'.
-                    type_check = m_type
-                    if type_check == "video_note":
-                        type_check = "video"
-                    if type_check not in media_types:
-                        result["skipped_count"] += 1
-                        continue
-
-                # Schedule the send in parallel (up to `parallel` at once)
-                task = _asyncio.create_task(_send_with_semaphore(msg.id))
-                pending_send_tasks.append(task)
-
-                # Periodically drain completed tasks to avoid the list growing
-                # unboundedly for huge channels.
-                if len(pending_send_tasks) >= parallel * 4:
-                    # Wait for at least one to complete before continuing.
-                    # NOTE: asyncio.wait returns (done, pending) as SETS, not
-                    # lists. We must convert back to a list to keep using
-                    # .append() later. (Bug: was assigning the set directly,
-                    # causing "AttributeError: 'set' object has no attribute
-                    # 'append'" on the next iteration.)
-                    done, pending = await _asyncio.wait(
-                        pending_send_tasks, return_when=_asyncio.FIRST_COMPLETED,
-                    )
-                    # Drain all done tasks (their results were already applied
-                    # via _send_one updating `result`)
-                    for t in done:
-                        try:
-                            t.result()  # raise exceptions if any
-                        except Exception:
-                            pass
-                    # Convert pending set back to list for .append() compatibility
-                    pending_send_tasks = list(pending)
-
-                # Progress callback
-                if progress_callback:
+        # ── Drain completed tasks efficiently ──────────────────────────────
+        def _drain_done_tasks():
+            """Remove completed tasks from pending_send_tasks to prevent
+            memory accumulation on massive channels."""
+            nonlocal pending_send_tasks
+            still_pending = []
+            for t in pending_send_tasks:
+                if t.done():
                     try:
-                        await progress_callback(
-                            result["sent_count"],
-                            result["total_seen"],
-                            result["last_message_id"],
-                            f"Sent {result['sent_count']} / seen {result['total_seen']}",
-                        )
+                        t.result()
                     except Exception:
                         pass
+                else:
+                    still_pending.append(t)
+            pending_send_tasks = still_pending
 
-                # Periodic status update
-                import time as _time
-                now = _time.time()
-                if status_callback and now - last_status_time > status_interval:
-                    last_status_time = now
-                    await status_callback(
-                        f"📊 Scraping in progress...\n\n"
-                        f"Total seen: {result['total_seen']}\n"
-                        f"Sent: {result['sent_count']}\n"
-                        f"Failed: {result['failed_count']}\n"
-                        f"Skipped (filtered/no media): {result['skipped_count']}\n"
-                        f"Last msg ID: {result['last_message_id']}\n"
-                        f"Parallel sends: {parallel}"
-                    )
+        # ── Main iteration loop with auto-reconnect ────────────────────────
+        current_min_id = min_id  # tracks where to resume after reconnect
 
-                # Send stats to stats_callback (for bot_data updates so
-                # /scrape_status shows current progress, not stale data)
-                if stats_callback:
-                    try:
-                        await stats_callback(result)
-                    except Exception:
-                        pass
+        while not (cancel_event and cancel_event.is_set()):
+            # Check cancellation at the top of every loop
+            if cancel_event and cancel_event.is_set():
+                result["cancelled"] = True
+                break
 
-        except ConnectionError as e:
-            # Connection dropped during iteration — try to reconnect and
-            # continue from where we left off (using min_id = last_message_id).
-            logger.warning("scrape_channel: connection dropped during iter_messages: %s", e)
-            if status_callback:
-                await status_callback(
-                    f"⚠️ Connection dropped: {type(e).__name__}: {e}\n"
-                    f"   Attempting to reconnect and continue from msg {result['last_message_id']}..."
-                )
-            if await self._ensure_connected():
-                # Re-issue iter_messages with min_id set to last processed id,
-                # so we resume from where we left off.
-                resume_kwargs = dict(iter_kwargs)
-                if result["last_message_id"] > 0:
-                    resume_kwargs["min_id"] = result["last_message_id"]
-                try:
-                    async for msg in self.client.iter_messages(source_entity, **resume_kwargs):
-                        if cancel_event and cancel_event.is_set():
-                            result["cancelled"] = True
-                            break
-                        result["total_seen"] += 1
-                        result["last_message_id"] = msg.id
-                        m_type = _classify_media(msg)
-                        if m_type is None:
-                            result["skipped_count"] += 1
-                            continue
-                        if media_types is not None:
-                            type_check = m_type
-                            if type_check == "video_note":
-                                type_check = "video"
-                            if type_check not in media_types:
-                                result["skipped_count"] += 1
-                                continue
-                        task = _asyncio.create_task(_send_with_semaphore(msg.id))
-                        pending_send_tasks.append(task)
-                        if len(pending_send_tasks) >= parallel * 4:
-                            done, pending = await _asyncio.wait(
-                                pending_send_tasks, return_when=_asyncio.FIRST_COMPLETED,
-                            )
-                            for t in done:
-                                try: t.result()
-                                except Exception: pass
-                            pending_send_tasks = list(pending)
-                except Exception as e2:
-                    logger.exception("scrape_channel: resume after reconnect also failed")
-                    if status_callback:
-                        await status_callback(f"❌ Resume after reconnect failed: {type(e2).__name__}: {e2}")
-                    result["failed_count"] = -1
-                    return result
-            else:
+            # Ensure connected before iterating
+            if not await self._ensure_connected():
                 if status_callback:
-                    await status_callback(f"❌ Could not reconnect: {type(e).__name__}: {e}")
+                    await status_callback("❌ Connection lost and reconnect failed. Stopping scrape.")
                 result["failed_count"] = -1
                 return result
 
-        except Exception as e:
-            logger.exception("scrape_channel: iter_messages failed")
-            if status_callback:
-                await status_callback(f"❌ Scrape error: {type(e).__name__}: {e}")
-            result["failed_count"] = -1
-            return result
+            # Build iter_kwargs with resume point
+            resume_kwargs = dict(iter_kwargs)
+            if current_min_id > 0:
+                resume_kwargs["min_id"] = current_min_id
+
+            try:
+                async for msg in self.client.iter_messages(source_entity, **resume_kwargs):
+                    # Check cancellation at every message
+                    if cancel_event and cancel_event.is_set():
+                        result["cancelled"] = True
+                        if pending_send_tasks:
+                            if status_callback:
+                                await status_callback(
+                                    f"🛑 Cancel received. Waiting for "
+                                    f"{len(pending_send_tasks)} in-flight send(s)..."
+                                )
+                            await _asyncio.gather(*pending_send_tasks, return_exceptions=True)
+                        if status_callback:
+                            await status_callback(
+                                f"🛑 Scraping cancelled by user.\n"
+                                f"   Sent: {result['sent_count']}, "
+                                f"Failed: {result['failed_count']}, "
+                                f"Skipped: {result['skipped_count']}"
+                            )
+                        break
+
+                    result["total_seen"] += 1
+                    result["last_message_id"] = msg.id
+                    current_min_id = msg.id  # track for resume after reconnect
+
+                    m_type = _classify_media(msg)
+                    if m_type is None:
+                        result["skipped_count"] += 1
+                        continue
+
+                    if media_types is not None:
+                        type_check = m_type
+                        if type_check == "video_note":
+                            type_check = "video"
+                        if type_check not in media_types:
+                            result["skipped_count"] += 1
+                            continue
+
+                    # Schedule the send in parallel
+                    task = _asyncio.create_task(_send_with_semaphore(msg))
+                    pending_send_tasks.append(task)
+
+                    # Drain on EVERY iteration — prevents memory leak on
+                    # massive channels (old code only drained when
+                    # pending >= parallel*4, causing accumulation)
+                    _drain_done_tasks()
+
+                    # If we have too many pending, wait for some to complete
+                    if len(pending_send_tasks) >= parallel * 2:
+                        done, pending = await _asyncio.wait(
+                            pending_send_tasks, return_when=_asyncio.FIRST_COMPLETED,
+                        )
+                        for t in done:
+                            try:
+                                t.result()
+                            except Exception:
+                                pass
+                        pending_send_tasks = list(pending)
+
+                    # Progress callback
+                    if progress_callback:
+                        try:
+                            await progress_callback(
+                                result["sent_count"],
+                                result["total_seen"],
+                                result["last_message_id"],
+                                f"Sent {result['sent_count']} / seen {result['total_seen']}",
+                            )
+                        except Exception:
+                            pass
+
+                    # Periodic status update
+                    now = _time.time()
+                    if status_callback and now - last_status_time > status_interval:
+                        last_status_time = now
+                        await status_callback(
+                            f"📊 Scraping in progress...\n\n"
+                            f"Total seen: {result['total_seen']}\n"
+                            f"Sent: {result['sent_count']}\n"
+                            f"Failed: {result['failed_count']}\n"
+                            f"Skipped: {result['skipped_count']}\n"
+                            f"Last msg ID: {result['last_message_id']}\n"
+                            f"Parallel sends: {parallel}"
+                        )
+
+                    if stats_callback:
+                        try:
+                            await stats_callback(result)
+                        except Exception:
+                            pass
+
+                # If we get here, iter_messages completed without error.
+                # Break out of the while loop — we're done.
+                break
+
+            except ConnectionError as e:
+                logger.warning("scrape_channel: connection dropped: %s", e)
+                if status_callback:
+                    await status_callback(
+                        f"⚠️ Connection dropped. Reconnecting and resuming from msg {current_min_id}..."
+                    )
+                # _ensure_connected is called at the top of the while loop
+                # The while loop will retry iter_messages with current_min_id
+                await _asyncio.sleep(2)  # brief pause before reconnect
+                continue
+
+            except _asyncio.CancelledError:
+                result["cancelled"] = True
+                break
+
+            except Exception as e:
+                logger.exception("scrape_channel: iter_messages failed")
+                if status_callback:
+                    await status_callback(f"❌ Scrape error: {type(e).__name__}: {e}")
+                result["failed_count"] = -1
+                return result
 
         # Wait for any remaining in-flight send tasks to complete
         if pending_send_tasks:
