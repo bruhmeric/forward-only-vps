@@ -159,12 +159,50 @@ Iterates ALL messages in the channel and sends media in parallel. See [Scraping]
 | `/test_link <url>` | Diagnostic: test fetching a t.me link (shows step-by-step report) |
 | `/saved <url>` | 🚀 FAST: send t.me link content directly to Saved Messages |
 | `/scrape <url> [flags]` | 🤖 AUTO: scrape ALL media from a channel |
-| `/stop_scrape` | 🛑 stop the active scrape |
-| `/scrape_status` | 📊 check scrape progress |
+| `/scrapeid <url> [start] [end] [flags]` | 🚀 FAST: forward by ID (no getHistory limits) |
+| `/stop_scrape [J1\|all]` | 🛑 stop one scrape job (or all) |
+| `/scrape_status` | 📊 progress of every running scrape |
 | `/caption <text>` | 📝 set a custom caption (replaces original on all forwards) |
 | `/caption strip` | 📝 strip ALL captions from forwarded media |
 | `/caption clear` | 📝 restore original caption behavior |
 | `/cancel` | Cancel any pending forward for this chat |
+
+---
+
+## Parallel scrapes (one `/scrape` + one `/scrapeid`)
+
+Multiple scrape jobs can run **at the same time** — the classic combo is one
+`/scrapeid` (forward-by-ID, SEND bucket) on one channel plus one `/scrape`
+(getHistory reads + sends, media filtering, noforwards fallback) on a different
+channel. Default limit: **2 concurrent jobs** (`MAX_CONCURRENT_SCRAPES`, 1–4).
+
+Each job is independent:
+
+- Its own status message in the bot with a live 2s ticker (tagged `J1`, `J2`, ...)
+- Its own wait-phase countdown — a flood wait or recovery break in J1 never
+  freezes or overwrites J2's status
+- Its own checkpoint, cancel event, pacing, and break scheduler
+- `/scrape_status` shows a block per job; the dashboard renders one card per
+  job with a per-job Stop button (plus Stop All)
+- `/stop_scrape J1` stops one job; `/stop_scrape all` stops everything
+
+Guard rails:
+
+- The **same channel can't be scraped by two jobs at once** — they would
+  fight over the shared `scrape_checkpoint:<ref>` resume state and duplicate
+  sends. The second command is refused with a pointer to the running job.
+- **All jobs share ONE Telegram account**, so the account-level rate budget is
+  shared too. Two jobs don't give double throughput — they give more frequent
+  (visible) flood waits. Each job's adaptive pacer reacts independently.
+- Two jobs sending into the **same destination** will interleave messages.
+
+```bash
+# two jobs at once:
+/scrapeid https://t.me/hugechannel 1 20000      # → job J1
+/scrape https://t.me/otherchannel saved old     # → job J2 (different channel!)
+/scrape_status                                   # both, side by side
+/stop_scrape J2                                  # stop just the /scrape
+```
 
 ---
 

@@ -68,6 +68,14 @@ class Config:
     # messages (0 disables), lasting flood_break_seconds.
     flood_break_every: int = 500
     flood_break_seconds: int = 300
+    # --- concurrent scrapes ---
+    # How many scrape jobs (mix of /scrape and /scrapeid) may run at the
+    # same time. Default 2 = one /scrape + one /scrapeid in parallel (the
+    # classic combo: /scrapeid hammers the SEND bucket while /scrape reads
+    # history). All jobs share ONE Telegram account, so the account-level
+    # rate budget is shared too — more jobs = more frequent flood waits,
+    # each shown as a live countdown per job.
+    max_concurrent_scrapes: int = 2
 
     @classmethod
     def load(cls) -> "Config":
@@ -114,6 +122,10 @@ class Config:
         flood_break_every = _env_int("FLOOD_BREAK_EVERY", 500)
         flood_break_seconds = _env_int("FLOOD_BREAK_SECONDS", 300, 0, 24 * 60 * 60)
 
+        # Concurrent scrape jobs (see dataclass docs above). 1 = old
+        # one-at-a-time behavior; 4 = hard ceiling.
+        max_concurrent_scrapes = _env_int("MAX_CONCURRENT_SCRAPES", 2, 1, 4)
+
         return cls(
             bot_token=token,
             api_id=int(api_id_raw) if api_id_raw else None,
@@ -131,6 +143,7 @@ class Config:
             flood_sleep_threshold=flood_sleep_threshold,
             flood_break_every=flood_break_every,
             flood_break_seconds=flood_break_seconds,
+            max_concurrent_scrapes=max_concurrent_scrapes,
         )
 
     @property

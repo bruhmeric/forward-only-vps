@@ -115,8 +115,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/saved <url>    — 🚀 FAST: send t.me link content to Saved Messages\n"
         "/scrape <url> [flags]  — 🤖 AUTO: scrape ALL media from a channel\n"
         "/scrapeid <url> [start] [end] [saved] [keep]  — 🚀 FAST: forward by ID (flood-adaptive)\n"
-        "/stop_scrape    — 🛑 stop the active scrape\n"
-        "/scrape_status  — 📊 check scrape progress\n"
+        "/stop_scrape [J1|all]  — 🛑 stop one scrape (or all)\n"
+        "/scrape_status  — 📊 progress of every running scrape\n"
+        "\n*Parallel scrapes:* up to 2 jobs can run at once — e.g. one "
+        "/scrapeid + one /scrape on different channels. Each gets its own "
+        "live status message.\n"
         "/caption <text>  — 📝 set a custom caption (replaces original)\n"
         "/caption strip   — 📝 strip ALL captions from forwarded media\n"
         "/caption clear   — 📝 restore original captions\n"
@@ -726,8 +729,148 @@ def _fmt_countdown(seconds: float) -> str:
     return f"{seconds}s"
 
 
-def _scrape_phase_line(context) -> str:
-    """Live one-line status of the current wait phase ('' while working)."""
+# ── Concurrent scrape job registry ─────────────────────────────────────────
+# The bot used to keep ONE global scrape slot (bot_data["scrape_task"] +
+# ["scrape_status"] + ["scrape_phase"] + ["scrape_cancel"]) and rejected any
+# second scrape with "a scrape is already running". That blocked the classic
+# combo — /scrapeid (forward-by-ID, SEND bucket) alongside /scrape
+# (getHistory reads) — which is exactly what people want for big channels.
+#
+# Now every scrape (either flavor) is a JOB in bot_data["scrape_jobs"], a
+# dict keyed by short id ("J1", "J2", ...). Each job owns its asyncio task,
+# cancel event, status counters, wait-phase dict, and its own Telegram
+# status message with a private ticker. Up to cfg.max_concurrent_scrapes
+# jobs (default 2, MAX_CONCURRENT_SCRAPES env var, hard cap 4) run at once;
+# the same channel can't be scraped by two jobs simultaneously (they would
+# fight over the shared `scrape_checkpoint:<ref>` resume state).
+#
+# All jobs still share one Telegram account — the per-account rate budget
+# is shared too, so two jobs means more frequent (visible) flood waits,
+# not double throughput.
+
+_MAX_JOBS_HARD = 4
+# A registered job whose task was never created within this many seconds is
+# treated as dead (command crashed between registration and task creation)
+# so it can't wedge the registry forever.
+_JOB_LEAK_TIMEOUT = 300.0
+
+
+def _scrape_jobs(context) -> dict:
+    """The job registry (created on first use). dict job_id -> job."""
+    jobs = context.bot_data.get("scrape_jobs")
+    if not isinstance(jobs, dict):
+        jobs = {}
+        context.bot_data["scrape_jobs"] = jobs
+    return jobs
+
+
+def _job_is_active(job: dict) -> bool:
+    """True while the job is (or is about to be) running."""
+    if job.get("finished_at"):
+        return False
+    task = job.get("task")
+    if task is None:
+        # Registered but task not created yet — active unless it's an
+        # obviously leaked registration.
+        return (time.time() - job.get("created_at", 0.0)) < _JOB_LEAK_TIMEOUT
+    return not task.done()
+
+
+def _active_scrape_jobs(context) -> list:
+    """All running jobs, oldest first (stable for display + stop ordering)."""
+    jobs = _scrape_jobs(context)
+    items = [j for j in jobs.values() if _job_is_active(j)]
+    items.sort(key=lambda j: (j.get("created_at", 0.0), j.get("job_id", "")))
+    return items
+
+
+def _prune_finished_jobs(jobs: dict, keep: int = 1) -> None:
+    """Keep only the newest `keep` finished jobs (for 'last results'
+    displays); older ones are dropped so the registry stays tiny."""
+    finished = [j for j in jobs.values()
+                if j.get("finished_at") and not _job_is_active(j)]
+    finished.sort(key=lambda j: j.get("finished_at", 0.0), reverse=True)
+    for j in finished[keep:]:
+        jobs.pop(j.get("job_id"), None)
+
+
+def _register_scrape_job(context, kind: str, chat_ref: str, dest_label: str):
+    """Atomically enforce limits and register a new scrape job.
+
+    Call this only AFTER all argument validation (the caller owns error
+    replies); it is synchronous, so two commands fired in the same event
+    loop tick cannot both slip past the limit. Returns (job, None) on
+    success or (None, (reason, detail)) on refusal:
+      ("duplicate", <existing job>)  — channel already being scraped
+      ("limit", <max jobs>)          — too many jobs running
+    """
+    cfg = context.bot_data.get("config")
+    max_jobs = getattr(cfg, "max_concurrent_scrapes", 2) if cfg else 2
+    try:
+        max_jobs = max(1, min(int(max_jobs), _MAX_JOBS_HARD))
+    except (TypeError, ValueError):
+        max_jobs = 2
+    jobs = _scrape_jobs(context)
+    active = [j for j in jobs.values() if _job_is_active(j)]
+    for j in active:
+        if j.get("chat_ref") == chat_ref:
+            return None, ("duplicate", j)
+    if len(active) >= max_jobs:
+        return None, ("limit", max_jobs)
+    _prune_finished_jobs(jobs)
+    seq = int(context.bot_data.get("scrape_job_seq", 0)) + 1
+    context.bot_data["scrape_job_seq"] = seq
+    job = {
+        "job_id": f"J{seq}",
+        "kind": kind,               # "scrape" | "scrapeid"
+        "chat_ref": chat_ref,
+        "source_ref": chat_ref,
+        "dest_label": dest_label,
+        "created_at": time.time(),
+        "finished_at": 0.0,
+        "task": None,               # asyncio.Task — set right after creation
+        "cancel_event": asyncio.Event(),
+        "phase": _new_phase_state(),
+        "status": {},
+    }
+    jobs[job["job_id"]] = job
+    return job, None
+
+
+def _unregister_scrape_job(context, job: dict) -> None:
+    """Remove a job that never really started (validation crashed after
+    registration). A job that DID start must instead set finished_at."""
+    _scrape_jobs(context).pop(job.get("job_id"), None)
+
+
+def _finish_scrape_job(job: dict) -> None:
+    """Mark a job finished; counters/phase stay readable for final reports."""
+    job["finished_at"] = time.time()
+    job["phase"]["key"] = None
+    job["phase"]["until"] = 0.0
+
+
+def _job_phase_line(job: dict) -> str:
+    """Live one-line wait phase for a job dict ('' while working)."""
+    ph = job.get("phase") or {}
+    key = ph.get("key")
+    if not key:
+        return ""
+    remaining = float(ph.get("until", 0.0)) - time.time()
+    if remaining <= 0:
+        return f"[{str(key).upper()}] wrapping up..."
+    resume = time.strftime("%H:%M", time.localtime(time.time() + remaining))
+    label = {"break": "RECOVERY BREAK", "flood": "FLOOD WAIT"}.get(key, str(key).upper())
+    stop_hint = f"/stop_scrape {job['job_id']} works"
+    return (f"[{label}] {_fmt_countdown(remaining)} remaining "
+            f"(resumes ~{resume}) — {stop_hint}")
+
+
+def _scrape_phase_line(context, job: dict | None = None) -> str:
+    """Live one-line status of the current wait phase ('' while working).
+    With `job`: reads that job's phase. Without: legacy global key."""
+    if job is not None:
+        return _job_phase_line(job)
     ph = context.bot_data.get("scrape_phase") or {}
     key = ph.get("key")
     if not key:
@@ -741,10 +884,58 @@ def _scrape_phase_line(context) -> str:
             f"(resumes ~{resume}) — /stop_scrape works")
 
 
-def _build_scrape_live_text(context, started_at: float) -> str:
-    """Build the live status text from bot_data: counts + active wait phase
-    + liveness. Shared by the /scrape and /scrapeid status tickers."""
-    st = context.bot_data.get("scrape_status", {})
+def _scrape_job_payload(job: dict, now: float | None = None) -> dict:
+    """JSON-serializable snapshot of one job for the /stats endpoint and
+    the dashboard. Pure function — safe to call from tests and bot.py."""
+    now = time.time() if now is None else now
+    st = job.get("status") or {}
+    ph = job.get("phase") or {}
+    running = _job_is_active(job)
+    phase_key = ph.get("key") if running else None
+    phase_remaining = max(0.0, float(ph.get("until", 0.0)) - now)
+    started_at = st.get("started_at")
+    return {
+        "job_id": job.get("job_id"),
+        "kind": job.get("kind"),
+        "running": running,
+        "source_ref": st.get("source_ref", job.get("source_ref")),
+        "dest_label": st.get("dest_label", job.get("dest_label")),
+        "order": st.get("order"),
+        "filter": st.get("filter", "ALL media"),
+        "parallel": st.get("parallel", 0),
+        "total_seen": st.get("total_seen", 0),
+        "sent_count": st.get("sent_count", 0),
+        "failed_count": st.get("failed_count", 0),
+        "skipped_count": st.get("skipped_count", 0),
+        "in_flight": st.get("in_flight", 0),
+        "last_message_id": st.get("last_message_id", 0),
+        "flood_waits": st.get("flood_waits", 0),
+        "started_at": started_at,
+        "elapsed_sec": (now - started_at) if started_at else 0,
+        # Live wait phase + countdown ("flood" | "break" | None)
+        "phase": phase_key,
+        "phase_note": ph.get("note", ""),
+        "phase_seconds_left": round(phase_remaining, 1) if phase_key else 0,
+        # Seconds since the last real progress update (liveness)
+        "seconds_since_progress": round(now - st["last_update"], 1)
+                                  if st.get("last_update") else None,
+    }
+
+
+def _build_scrape_live_text(context, started_at: float, job: dict | None = None) -> str:
+    """Build the live status text: counts + active wait phase + liveness.
+    With `job`: renders that job's numbers/phase and a job-tagged header
+    (so two concurrent scrapes are distinguishable at a glance). Without:
+    legacy single-scrape behavior reading bot_data directly."""
+    if job is not None:
+        st = job.get("status") or {}
+        phase = _job_phase_line(job)
+        title = (f">>> SCRAPE {job['job_id']} (/{job.get('kind', 'scrape')}) "
+                 f"IN PROGRESS <<<")
+    else:
+        st = context.bot_data.get("scrape_status", {})
+        phase = _scrape_phase_line(context)
+        title = ">>> SCRAPE IN PROGRESS <<<"
     sent = st.get("sent_count", 0)
     failed = st.get("failed_count", 0)
     skipped = st.get("skipped_count", 0)
@@ -773,7 +964,6 @@ def _build_scrape_live_text(context, started_at: float) -> str:
     # for "currently waiting" — flood_waits is a HISTORICAL counter and must
     # not claim the bot is flood-waiting right now (that misled users into
     # thinking a working scrape was stuck).
-    phase = _scrape_phase_line(context)
     if phase:
         activity = phase
     elif in_flight > 0:
@@ -800,7 +990,7 @@ def _build_scrape_live_text(context, started_at: float) -> str:
             eta_str = f"\nETA:       {eta_sec:.0f}s"
 
     return (
-        f">>> SCRAPE IN PROGRESS <<<\n"
+        f"{title}\n"
         f"{activity}\n\n"
         f"Progress: [{bar}] {pct:.0f}%\n"
         f"----------------------------------------\n"
@@ -819,8 +1009,13 @@ def _build_scrape_live_text(context, started_at: float) -> str:
 
 
 async def _run_scrape_status_ticker(context, edit_fn, started_at: float,
-                                    interval: float = 2.0):
+                                    interval: float = 2.0, job: dict | None = None):
     """Background loop refreshing the status message every `interval` seconds.
+
+    With `job`: watches THAT job's task and renders that job's counts —
+    each concurrent scrape has its own ticker, its own Telegram message,
+    and they never overwrite each other. Without: legacy single-scrape
+    behavior watching bot_data["scrape_task"].
 
     While a wait phase (flood/break) is active the text contains a live
     countdown, so it CHANGES every tick — the edit goes through and the
@@ -830,17 +1025,22 @@ async def _run_scrape_status_ticker(context, edit_fn, started_at: float,
     while True:
         try:
             await asyncio.sleep(interval)
-            task = context.bot_data.get("scrape_task")
+            if job is not None:
+                task = job.get("task")
+            else:
+                task = context.bot_data.get("scrape_task")
             if task and task.done():
                 # Scrape finished — one final update, then exit
                 try:
-                    await edit_fn(_build_scrape_live_text(context, started_at),
+                    await edit_fn(_build_scrape_live_text(context, started_at,
+                                                          job=job),
                                   force=True)
                 except Exception:
                     pass
                 break
             try:
-                await edit_fn(_build_scrape_live_text(context, started_at),
+                await edit_fn(_build_scrape_live_text(context, started_at,
+                                                      job=job),
                               force=False)
             except Exception:
                 pass
@@ -911,13 +1111,10 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
-    # Check if there's already an active scrape
-    if context.bot_data.get("scrape_task") and not context.bot_data["scrape_task"].done():
-        await update.effective_message.reply_text(
-            "⚠️ A scrape is already running. Use /stop_scrape to stop it first, "
-            "or /scrape_status to check progress."
-        )
-        return
+    # NOTE: no single-scrape gate anymore — up to MAX_CONCURRENT_SCRAPES
+    # jobs (mix of /scrape + /scrapeid) may run at once. The limit, and the
+    # same-channel-duplicate guard, are enforced atomically at registration
+    # time (below, after all validation).
 
     if not context.args:
         await update.effective_message.reply_text(
@@ -1053,22 +1250,60 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 "(Checkpoints are saved automatically during every scrape.)"
             )
 
-    # Initial status message
-    status_msg = await update.effective_message.reply_text(
-        f"🔍 Starting scrape...\n\n"
-        f"Source: `{parsed.chat_ref}`\n"
-        f"Destination: {dest_label}\n"
-        f"Order: {'oldest first' if oldest_first else 'newest first'}\n"
-        f"Filter: {filter_desc}\n"
-        f"Parallel: {parallel} sends{resume_note}\n\n"
-        f"_Use /stop_scrape to cancel, /scrape_status to check progress._",
-        parse_mode="Markdown",
-    )
+    # ── Register this scrape as a job ─────────────────────────────────────
+    # Atomic limit + duplicate-channel check (see _register_scrape_job).
+    # Runs AFTER all validation so a refused command never creates state.
+    job, refusal = _register_scrape_job(context, "scrape", parsed.chat_ref, dest_label)
+    if job is None:
+        reason, detail = refusal
+        if reason == "duplicate":
+            await update.effective_message.reply_text(
+                f"⚠️ `{parsed.chat_ref}` is already being scraped by job "
+                f"{detail['job_id']} (/{detail['kind']}).\n\n"
+                f"Two jobs on the same channel would corrupt the resume "
+                f"checkpoint and duplicate sends.\n"
+                f"Use /scrape_status to watch it, or /stop_scrape "
+                f"{detail['job_id']} to stop it.",
+                parse_mode="Markdown",
+            )
+        else:
+            active = _active_scrape_jobs(context)
+            listing = "\n".join(
+                f"  • {j['job_id']} — /{j['kind']} `{j.get('chat_ref', '?')}`" for j in active
+            ) or "  (none)"
+            await update.effective_message.reply_text(
+                f"⚠️ Already running {len(active)} scrape job(s) — the limit is "
+                f"{detail} (MAX_CONCURRENT_SCRAPES).\n\n{listing}\n\n"
+                f"Stop one first (`/stop_scrape <job_id>`) or raise "
+                f"MAX_CONCURRENT_SCRAPES in .env.",
+                parse_mode="Markdown",
+            )
+        return
 
-    # Set up cancellation event and status storage
-    cancel_event = asyncio.Event()
-    context.bot_data["scrape_cancel"] = cancel_event
-    context.bot_data["scrape_status"] = {
+    try:
+        # Initial status message
+        status_msg = await update.effective_message.reply_text(
+            f"🔍 Starting scrape {job['job_id']}...\n\n"
+            f"Source: `{parsed.chat_ref}`\n"
+            f"Destination: {dest_label}\n"
+            f"Order: {'oldest first' if oldest_first else 'newest first'}\n"
+            f"Filter: {filter_desc}\n"
+            f"Parallel: {parallel} sends{resume_note}\n\n"
+            f"_Use /stop_scrape {job['job_id']} to cancel, /scrape_status to check progress._",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        # Status message is unsendable (network hiccup, chat error) — the
+        # job could run but silently. Unregister and bail out instead.
+        _unregister_scrape_job(context, job)
+        logger.warning("/scrape: could not send status message: %s", e)
+        return
+
+    # Per-job state: cancel event, counters, wait phase. All of this used
+    # to live in bot_data["scrape_*"] global keys — now every job carries
+    # its own, so two concurrent scrapes never clobber each other.
+    cancel_event = job["cancel_event"]
+    job["status"] = {
         "sent_count": 0,
         "failed_count": 0,
         "skipped_count": 0,
@@ -1084,14 +1319,13 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # Shared wait-phase dict — scrape_channel publishes flood waits and
     # recovery breaks here; the ticker renders them as LIVE countdowns so
     # a long wait never looks like a hang again.
-    phase_state = _new_phase_state()
-    context.bot_data["scrape_phase"] = phase_state
+    phase_state = job["phase"]
 
     # ── Real-time status update system ─────────────────────────────────────
     # Design:
-    #   - A dedicated background ticker task updates the Telegram message
-    #     every 2 seconds with the latest counts from bot_data.
-    #   - stats_callback only updates bot_data (no Telegram API calls) —
+    #   - A dedicated background ticker task updates THIS job's Telegram
+    #     message every 2 seconds with the latest counts from job["status"].
+    #   - stats_callback only updates the job dict (no Telegram API calls) —
     #     this avoids race conditions from concurrent edit_text calls.
     #   - status_callback is for milestone events (start, FloodWait, cancel,
     #     complete) and uses an asyncio.Lock to serialize edits.
@@ -1131,15 +1365,15 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     def _build_live_status_text() -> str:
         # Shared builder (module level, above): counts + active wait phase
         # with LIVE countdown + "Last progress: Xs ago" liveness line.
-        return _build_scrape_live_text(context, started_at)
+        return _build_scrape_live_text(context, started_at, job=job)
 
     async def _status_ticker():
-        """Background task that updates the Telegram message every 2 seconds.
-        This is the ONLY thing that edits the message during a scrape —
-        stats_callback just updates bot_data, avoiding race conditions.
+        """Background task that updates THIS job's Telegram message every
+        2 seconds. The ONLY thing that edits the message during a scrape —
+        stats_callback just updates job["status"], avoiding race conditions.
         Delegates to the shared _run_scrape_status_ticker."""
         await _run_scrape_status_ticker(context, _edit_telegram_message_safe,
-                                        started_at)
+                                        started_at, job=job)
 
     # Start the background ticker
     ticker_task_ref["task"] = _asyncio.create_task(_status_ticker())
@@ -1148,20 +1382,20 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         """Called by scrape_channel for milestone events (start, FloodWait,
         cancel, complete). Force-edits the Telegram message."""
         now = time.time()
-        context.bot_data["scrape_status"].update({
+        job["status"].update({
             "last_update": now,
         })
         await _edit_telegram_message_safe(text, force=True)
 
     async def stats_callback(result_dict: dict):
         """Called on EVERY send completion and every message iteration.
-        ONLY updates bot_data — does NOT edit the Telegram message.
-        The background _status_ticker handles message edits every 2s.
-        This prevents race conditions from concurrent send completions.
+        ONLY updates this job's status dict — does NOT edit the Telegram
+        message. The background _status_ticker handles message edits every
+        2s. This prevents race conditions from concurrent send completions.
         Also persists the per-channel checkpoint (last_message_id) to
         SQLite after every batch, so `resume` can pick it up after a
         crash, a flood abort, or a manual /stop_scrape."""
-        context.bot_data["scrape_status"].update({
+        job["status"].update({
             "sent_count": result_dict.get("sent_count", 0),
             "failed_count": result_dict.get("failed_count", 0),
             "skipped_count": result_dict.get("skipped_count", 0),
@@ -1255,11 +1489,12 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     cancelled = scrape_result.get("cancelled", False)
 
                     if cancelled:
-                        status_line = ">>> SCRAPE CANCELLED <<<"
+                        state = "CANCELLED"
                     elif failed > 0 and sent == 0:
-                        status_line = ">>> SCRAPE COMPLETED (with errors) <<<"
+                        state = "COMPLETED (with errors)"
                     else:
-                        status_line = ">>> SCRAPE COMPLETE <<<"
+                        state = "COMPLETE"
+                    status_line = f">>> SCRAPE {job['job_id']} {state} <<<"
 
                     throughput = sent / (elapsed / 60) if elapsed > 60 else 0
 
@@ -1298,13 +1533,14 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 await _edit_telegram_message_safe(final_text, force=True)
             except Exception:
                 pass
-            # Clean up the scrape state when done
-            context.bot_data.pop("scrape_task", None)
-            context.bot_data.pop("scrape_cancel", None)
-            context.bot_data.pop("scrape_phase", None)
+            # Mark the job finished — its counters stay readable for
+            # /scrape_status and the dashboard's "last results" panel; the
+            # registry prunes old finished jobs on the next registration.
+            _finish_scrape_job(job)
 
-    context.bot_data["scrape_task"] = asyncio.create_task(scrape_task())
-    logger.info("Scrape started for %s -> %s", parsed.chat_ref, dest_label)
+    job["task"] = asyncio.create_task(scrape_task())
+    logger.info("Scrape %s started for %s -> %s", job["job_id"],
+                parsed.chat_ref, dest_label)
 
 
 async def _get_custom_caption(context) -> str | None:
@@ -1400,134 +1636,219 @@ async def cmd_caption(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
 
 
+def _resolve_stop_targets(context, arg: str):
+    """Pick which scrape jobs a stop request applies to.
+
+    Returns (targets, error) where targets is a list of job dicts and
+    error is None | "none" | "ambiguous" | "unknown".
+      ""              — single active job -> [it]; several -> "ambiguous"
+      "all" / "*"     — every active job
+      "J2" / "j2" / "2" — that specific job ("unknown" if not active)
+    """
+    jobs = _scrape_jobs(context)
+    active = {jid: j for jid, j in jobs.items() if _job_is_active(j)}
+    if not active:
+        return [], "none"
+    a = (arg or "").strip().lower()
+    if a in ("all", "*"):
+        return [active[k] for k in sorted(active)], None
+    if not a:
+        if len(active) == 1:
+            return list(active.values()), None
+        return None, "ambiguous"
+    jid = a if a.startswith("j") else f"j{a}"
+    jid = jid.upper()
+    job = active.get(jid)
+    if job is None:
+        return None, "unknown"
+    return [job], None
+
+
+def _job_running(job: dict) -> bool:
+    """True while the job is running or still starting up (task not yet
+    created). Delegates to _job_is_active so all three helpers agree —
+    a job that just registered must not be reported as 'already done'
+    when a stop request lands in that window."""
+    return _job_is_active(job)
+
+
+def _job_done(job: dict) -> bool:
+    return not _job_is_active(job)
+
+
+async def _stop_scrape_jobs(context, jobs: list, user_session) -> str:
+    """Tiered stop of the given jobs. Returns a human summary.
+
+    Tiers (per the original design — /stop_scrape must ALWAYS work):
+      1. cancel_event (graceful — the scrape stops at its next check)
+      2. task.cancel() after a 10s grace window
+      3. Telethon client disconnect (last resort — unblocks stuck socket
+         reads). Other running jobs reconnect automatically and resume
+         from their checkpoints, but expect a short pause for them.
+    """
+    import asyncio as _asyncio
+
+    # Tier 1 — graceful
+    for j in jobs:
+        j["cancel_event"].set()
+    for _ in range(10):
+        await _asyncio.sleep(1)
+        if all(_job_done(j) for j in jobs):
+            return ("✅ Stopped gracefully: " +
+                    ", ".join(j["job_id"] for j in jobs))
+
+    # Tier 2 — force-cancel the task
+    for j in jobs:
+        if _job_running(j):
+            try:
+                j["task"].cancel()
+            except Exception:
+                pass
+    await _asyncio.sleep(3)
+    if all(_job_done(j) for j in jobs):
+        return ("🛑 Force-stopped via task.cancel(): " +
+                ", ".join(j["job_id"] for j in jobs))
+
+    # Tier 3 — disconnect the shared Telethon client (last resort)
+    stuck = [j["job_id"] for j in jobs if _job_running(j)]
+    if user_session:
+        try:
+            await user_session.client.disconnect()
+            await _asyncio.sleep(2)
+            await user_session._ensure_connected()
+            return (f"🛑 {', '.join(stuck)} force-stopped via client "
+                    f"disconnect (Telethon reconnected).")
+        except Exception as e:
+            return (f"🛑 Force-stop attempted on {', '.join(stuck)}: "
+                    f"{type(e).__name__}: {e}\n"
+                    f"Try: docker-compose restart forwarder-bot")
+    return (f"🛑 {', '.join(stuck)} did not respond — Telethon session "
+            f"unavailable for tier-3 disconnect. Try restarting the container.")
+
+
 async def cmd_stop_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Stop the currently running scrape.
+    """Stop running scrape job(s).
 
-    Uses a three-tier approach:
-    1. Set the cancel_event (graceful — scrape stops at next check point)
-    2. If the scrape doesn't stop within 10 seconds, forcefully cancel the task
-    3. If that doesn't work either, disconnect the Telethon client (tears down
-       the blocked transport, unblocking any stuck socket reads)
+    Usage:
+      /stop_scrape          — stop the scrape (if only one is running)
+      /stop_scrape J1       — stop job J1 specifically
+      /stop_scrape all      — stop every running scrape
 
-    This ensures /stop_scrape ALWAYS works, even when the scrape is stuck
-    in a blocking I/O call that doesn't respond to task.cancel().
+    Multiple scrapes can run at once now (one /scrape + one /scrapeid is
+    the classic combo) — see /scrape_status for the live job IDs.
     """
     cfg = context.bot_data["config"]
     if not cfg.is_admin(update.effective_user.id):
         return
-    cancel_event = context.bot_data.get("scrape_cancel")
-    task = context.bot_data.get("scrape_task")
     user_session = context.bot_data.get("user_session")
-    if not task or task.done():
+
+    arg = context.args[0] if context.args else ""
+    jobs, err = _resolve_stop_targets(context, arg)
+    if err == "none":
         await update.effective_message.reply_text("No active scrape to stop.")
         return
-
-    # Tier 1: Set the cancel event (graceful stop)
-    if cancel_event:
-        cancel_event.set()
-
-    status_msg = await update.effective_message.reply_text(
-        "🛑 Stop signal sent. Waiting for graceful stop (up to 10s)..."
-    )
-
-    # Wait up to 10 seconds for graceful stop
-    import asyncio as _asyncio
-    stopped_gracefully = False
-    for _ in range(10):
-        await _asyncio.sleep(1)
-        if task.done():
-            stopped_gracefully = True
-            break
-
-    if not stopped_gracefully:
-        # Tier 2: Force cancel the task
-        try:
-            task.cancel()
-            await _asyncio.sleep(3)
-            if task.done():
-                await status_msg.edit_text(
-                    "🛑 Scrape force-stopped via task.cancel().\n"
-                    "Use /scrape_status to see final stats."
-                )
-                return
-        except Exception:
-            pass
-
-        # Tier 3: Disconnect the Telethon client (last resort)
-        # This tears down the blocked transport, unblocking any stuck
-        # socket reads in get_messages or send_file.
-        if user_session:
-            try:
-                await status_msg.edit_text(
-                    "🛑 Scrape didn't respond to cancel. Disconnecting Telethon client..."
-                )
-                await user_session.client.disconnect()
-                await _asyncio.sleep(2)
-                # Reconnect for future use
-                await user_session._ensure_connected()
-                await status_msg.edit_text(
-                    "🛑 Scrape force-stopped via client disconnect.\n"
-                    "Telethon reconnected. Use /scrape_status to see final stats."
-                )
-            except Exception as e:
-                await status_msg.edit_text(
-                    f"🛑 Force-stop attempted.\n"
-                    f"Error: {type(e).__name__}: {e}\n"
-                    f"Try: docker-compose restart forwarder-bot"
-                )
-    else:
-        await status_msg.edit_text(
-            "✅ Scrape stopped gracefully.\n"
-            "Use /scrape_status to see final stats."
+    if err == "ambiguous":
+        active = _active_scrape_jobs(context)
+        listing = "\n".join(
+            f"  `/{j['kind']}` `{j.get('chat_ref', '?')}` → /stop_scrape {j['job_id']}"
+            for j in active
         )
+        await update.effective_message.reply_text(
+            f"⚠️ {len(active)} scrapes are running — pick one:\n\n{listing}\n\n"
+            f"Or stop everything: `/stop_scrape all`",
+            parse_mode="Markdown",
+        )
+        return
+    if err == "unknown":
+        await update.effective_message.reply_text(
+            f"❌ No active job matching `{arg}`.\n"
+            f"Use /scrape_status to see the running job IDs.",
+            parse_mode="Markdown",
+        )
+        return
+
+    ids = ", ".join(j["job_id"] for j in jobs)
+    status_msg = await update.effective_message.reply_text(
+        f"🛑 Stop signal sent to {ids}. Waiting for graceful stop (up to 10s)..."
+    )
+    summary = await _stop_scrape_jobs(context, jobs, user_session)
+    try:
+        await status_msg.edit_text(
+            f"{summary}\nUse /scrape_status to see final stats."
+        )
+    except Exception:
+        pass
 
 
-async def cmd_scrape_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show the current scrape status."""
-    cfg = context.bot_data["config"]
-    if not cfg.is_admin(update.effective_user.id):
-        return
-    status = context.bot_data.get("scrape_status")
-    task = context.bot_data.get("scrape_task")
-    if not status:
-        await update.effective_message.reply_text("No scrape has been started yet.")
-        return
-    running = task and not task.done()
-    elapsed = time.time() - status.get("started_at", 0) if status.get("started_at") else 0
+def _format_job_status_block(job: dict, running: bool) -> str:
+    """One job's block for /scrape_status (counts + phase + liveness)."""
+    st = job.get("status") or {}
     state_str = "🟢 running" if running else "🔴 finished"
+    started = st.get("started_at")
+    elapsed = (time.time() - started) if started else 0
 
-    # Live wait phase (flood wait / recovery break) with countdown, plus a
-    # liveness line — so "waiting 20 min for the rate budget" is clearly
-    # distinguishable from "hung".
     phase_str = ""
     if running:
-        pl = _scrape_phase_line(context)
+        pl = _job_phase_line(job)
         if pl:
-            phase_str = f"\n⏳ Currently: {pl}\n"
+            phase_str = f"\n⏳ Currently: {pl}"
     liveness_str = ""
-    last_upd = status.get("last_update", 0)
+    last_upd = st.get("last_update", 0)
     if running and last_upd:
         idle = time.time() - last_upd
         liveness_str = f"\nLast progress: {_fmt_countdown(idle)} ago"
 
-    await update.effective_message.reply_text(
-        f"📊 Scrape status: {state_str}\n\n"
-        f"Source: `{status.get('source_ref', '?')}`\n"
-        f"Destination: {status.get('dest_label', '?')}\n"
-        f"Order: {status.get('order', '?')}\n"
-        f"Filter: {status.get('filter', 'ALL media')}\n"
-        f"Parallel: {status.get('parallel', 3)}\n"
-        f"Elapsed: {elapsed:.0f} sec\n"
+    return (
+        f"━━ Job {job.get('job_id')} — /{job.get('kind', '?')} — {state_str} ━━\n"
+        f"Source: `{st.get('source_ref', job.get('chat_ref', '?'))}`\n"
+        f"Destination: {st.get('dest_label', '?')}\n"
+        f"Order: {st.get('order', '?')}\n"
+        f"Filter: {st.get('filter', 'ALL media')}\n"
+        f"Parallel: {st.get('parallel', 3)}\n"
+        f"Elapsed: {elapsed:.0f} sec"
         f"{phase_str}"
         f"{liveness_str}\n\n"
-        f"Total seen: {status.get('total_seen', 0)}\n"
-        f"Sent: {status.get('sent_count', 0)}\n"
-        f"Failed: {status.get('failed_count', 0)}\n"
-        f"Skipped (filtered/no media): {status.get('skipped_count', 0)}\n"
-        f"Flood waits: {status.get('flood_waits', 0)}\n"
-        f"Last msg ID: {status.get('last_message_id', 0)}",
-        parse_mode="Markdown",
+        f"Total seen: {st.get('total_seen', 0)}\n"
+        f"Sent: {st.get('sent_count', 0)}\n"
+        f"Failed: {st.get('failed_count', 0)}\n"
+        f"Skipped (filtered/no media): {st.get('skipped_count', 0)}\n"
+        f"Flood waits: {st.get('flood_waits', 0)}\n"
+        f"Last msg ID: {st.get('last_message_id', 0)}"
     )
+
+
+async def cmd_scrape_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the status of ALL running scrape jobs (plus the last finished one).
+
+    Every job gets its own block with counts, live wait phase, and a
+    liveness line — so "waiting 20 min for the rate budget" is clearly
+    distinguishable from "hung", even with two scrapes running at once.
+    """
+    cfg = context.bot_data["config"]
+    if not cfg.is_admin(update.effective_user.id):
+        return
+    jobs = _scrape_jobs(context)
+    if not jobs:
+        await update.effective_message.reply_text("No scrape has been started yet.")
+        return
+    active = _active_scrape_jobs(context)
+    if active:
+        parts = [f"📊 Scrapes running: {len(active)}", ""]
+        for j in active:
+            parts.append(_format_job_status_block(j, running=True))
+            parts.append("")
+        parts.append("Stop one: `/stop_scrape <job_id>` · Stop all: `/stop_scrape all`")
+        text = "\n".join(parts)
+    else:
+        # Show the most recent finished job (kept in the registry)
+        finished = [j for j in jobs.values() if j.get("finished_at")]
+        if finished:
+            last = max(finished, key=lambda j: j["finished_at"])
+            text = ("📊 No active scrape.\n\nLast finished job:\n\n"
+                    + _format_job_status_block(last, running=False))
+        else:
+            text = "No scrape has been started yet."
+    await update.effective_message.reply_text(text, parse_mode="Markdown")
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1671,12 +1992,9 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    # Check if there's already an active scrape
-    if context.bot_data.get("scrape_task") and not context.bot_data["scrape_task"].done():
-        await update.effective_message.reply_text(
-            "⚠️ A scrape is already running. Use /stop_scrape to stop it first."
-        )
-        return
+    # NOTE: no single-scrape gate anymore — see /scrape. Multiple jobs
+    # (one /scrape + one /scrapeid is the classic combo) run in parallel;
+    # limits are enforced at registration, below.
 
     if not context.args:
         await update.effective_message.reply_text(
@@ -1780,24 +2098,56 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 "ℹ️ No checkpoint found for this channel — starting from ID 1."
             )
 
-    # Initial status message
-    range_str = f"{start_id} to {'auto' if end_id == 0 else end_id}"
-    status_msg = await update.effective_message.reply_text(
-        f"🚀 Starting ID-based forward...\n\n"
-        f"Source: `{parsed.chat_ref}`\n"
-        f"Destination: {dest_label}\n"
-        f"ID range: {range_str}\n"
-        f"Keep author: {keep_author}\n"
-        f"Strip captions: {strip_captions}{resume_note}\n\n"
-        f"_Uses forward_messages by ID — no getHistory rate limits._\n"
-        f"_Send /stop_scrape to cancel._",
-        parse_mode="Markdown",
-    )
+    # ── Register this scrape as a job (atomic limit + duplicate guard) ──
+    job, refusal = _register_scrape_job(context, "scrapeid", parsed.chat_ref, dest_label)
+    if job is None:
+        reason, detail = refusal
+        if reason == "duplicate":
+            await update.effective_message.reply_text(
+                f"⚠️ `{parsed.chat_ref}` is already being scraped by job "
+                f"{detail['job_id']} (/{detail['kind']}).\n\n"
+                f"Two jobs on the same channel would corrupt the resume "
+                f"checkpoint and duplicate sends.\n"
+                f"Use /scrape_status to watch it, or /stop_scrape "
+                f"{detail['job_id']} to stop it.",
+                parse_mode="Markdown",
+            )
+        else:
+            active = _active_scrape_jobs(context)
+            listing = "\n".join(
+                f"  • {j['job_id']} — /{j['kind']} `{j.get('chat_ref', '?')}`" for j in active
+            ) or "  (none)"
+            await update.effective_message.reply_text(
+                f"⚠️ Already running {len(active)} scrape job(s) — the limit is "
+                f"{detail} (MAX_CONCURRENT_SCRAPES).\n\n{listing}\n\n"
+                f"Stop one first (`/stop_scrape <job_id>`) or raise "
+                f"MAX_CONCURRENT_SCRAPES in .env.",
+                parse_mode="Markdown",
+            )
+        return
 
-    # Set up cancellation and status
-    cancel_event = asyncio.Event()
-    context.bot_data["scrape_cancel"] = cancel_event
-    context.bot_data["scrape_status"] = {
+    try:
+        # Initial status message
+        range_str = f"{start_id} to {'auto' if end_id == 0 else end_id}"
+        status_msg = await update.effective_message.reply_text(
+            f"🚀 Starting ID-based forward {job['job_id']}...\n\n"
+            f"Source: `{parsed.chat_ref}`\n"
+            f"Destination: {dest_label}\n"
+            f"ID range: {range_str}\n"
+            f"Keep author: {keep_author}\n"
+            f"Strip captions: {strip_captions}{resume_note}\n\n"
+            f"_Uses forward_messages by ID — no getHistory rate limits._\n"
+            f"_Send /stop_scrape {job['job_id']} to cancel._",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        _unregister_scrape_job(context, job)
+        logger.warning("/scrapeid: could not send status message: %s", e)
+        return
+
+    # Per-job state (see /scrape — every job owns its counters + phase)
+    cancel_event = job["cancel_event"]
+    job["status"] = {
         "sent_count": 0, "failed_count": 0, "skipped_count": 0,
         "total_seen": 0, "last_message_id": 0, "started_at": _time.time(),
         "source_ref": parsed.chat_ref, "dest_label": dest_label,
@@ -1809,13 +2159,12 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # countdowns. /scrapeid previously had NO ticker at all, so its status
     # message went completely static during breaks/flood waits — exactly
     # the "stuck, nothing updates" symptom.
-    phase_state = _new_phase_state()
-    context.bot_data["scrape_phase"] = phase_state
+    phase_state = job["phase"]
 
     # Status callbacks — same locked-edit + ticker design as /scrape:
-    # stats_callback only touches bot_data; the 2s ticker is the ONLY thing
-    # that edits the message; milestone notices force-edit but the ticker's
-    # live text (which includes the wait phase) follows 2s later.
+    # stats_callback only touches job["status"]; the 2s ticker is the ONLY
+    # thing that edits the message; milestone notices force-edit but the
+    # ticker's live text (which includes the wait phase) follows 2s later.
     status_lock = asyncio.Lock()
     last_edit_time = {"time": 0.0}
     ticker_task_ref = {"task": None}
@@ -1837,18 +2186,18 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     last_edit_time["time"] = now + 3.0
                 # "not modified" and everything else: ignore, never fatal
 
-    # Live status ticker (shared with /scrape): renders counts PLUS the
-    # active wait phase with a ticking countdown + liveness line.
+    # Live status ticker (shared with /scrape): renders THIS job's counts
+    # PLUS the active wait phase with a ticking countdown + liveness line.
     ticker_task_ref["task"] = asyncio.create_task(
-        _run_scrape_status_ticker(context, _edit_status, started_at)
+        _run_scrape_status_ticker(context, _edit_status, started_at, job=job)
     )
 
     async def status_callback(text):
-        context.bot_data["scrape_status"]["last_update"] = _time.time()
+        job["status"]["last_update"] = _time.time()
         await _edit_status(text, force=True)
 
     async def stats_callback(result_dict):
-        context.bot_data["scrape_status"].update({
+        job["status"].update({
             "sent_count": result_dict.get("sent_count", 0),
             "failed_count": result_dict.get("failed_count", 0),
             "total_seen": result_dict.get("total_seen", 0),
@@ -1914,7 +2263,8 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     last_id = scrape_result.get("last_message_id", 0)
                     cancelled = scrape_result.get("cancelled", False)
 
-                    status_line = ">>> SCRAPE CANCELLED <<<" if cancelled else ">>> SCRAPE COMPLETE <<<"
+                    state = "CANCELLED" if cancelled else "COMPLETE"
+                    status_line = f">>> SCRAPE {job['job_id']} {state} <<<"
                     final_text = (
                         f"{status_line}\n\n"
                         f"Source:      {parsed.chat_ref}\n"
@@ -1941,12 +2291,13 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     await t
                 except Exception:
                     pass
-            context.bot_data.pop("scrape_task", None)
-            context.bot_data.pop("scrape_cancel", None)
-            context.bot_data.pop("scrape_phase", None)
+            # Mark the job finished (counters stay for /scrape_status and
+            # the dashboard; the registry prunes it on the next registration)
+            _finish_scrape_job(job)
 
-    context.bot_data["scrape_task"] = asyncio.create_task(scrape_task())
-    logger.info("ID-based scrape started for %s -> %s", parsed.chat_ref, dest_label)
+    job["task"] = asyncio.create_task(scrape_task())
+    logger.info("ID-based scrape %s started for %s -> %s", job["job_id"],
+                parsed.chat_ref, dest_label)
 
 
 def register_admin_handlers(app) -> None:

@@ -48,6 +48,14 @@ logging.getLogger("telethon").setLevel(logging.WARNING)
 logger = logging.getLogger("forwarder")
 
 
+class _CtxView:
+    """Duck-typed context so admin-module helpers (which expect a PTB
+    context with .bot_data) can read the raw bot_data dict from plain
+    aiohttp handlers."""
+    def __init__(self, data):
+        self.bot_data = data
+
+
 # ---------------------------------------------------------------------------
 # Application lifecycle hooks (called by PTB in both polling and webhook mode)
 # ---------------------------------------------------------------------------
@@ -172,25 +180,35 @@ async def _run_polling_with_stats(app: Application, cfg: Config) -> None:
         if user_session:
             telethon_status = "connected" if user_session.available else "disconnected"
 
-        # Scrape status
-        scrape_status = bot_data.get("scrape_status", {})
-        scrape_phase = bot_data.get("scrape_phase") or {}
-        scrape_task = bot_data.get("scrape_task")
-        scrape_running = scrape_task and not scrape_task.done()
+        # Scrape status — the job registry (multiple scrapes can run at
+        # once: one /scrape + one /scrapeid is the classic combo). We
+        # publish a `scrapes` array (one entry per job) plus the legacy
+        # single-job `scrape` object (most recent active job, else the
+        # last finished one) so old dashboards keep working.
+        from handlers.admin import (_get_custom_caption, _scrape_jobs,
+                                    _scrape_job_payload,
+                                    _active_scrape_jobs, _job_is_active)
 
-        # Live wait phase (flood wait / recovery break) — the scrape can sit
-        # inside a server-requested FloodWait for many minutes; publishing
-        # the phase + countdown lets the dashboard show "waiting, resumes
-        # at 15:42" instead of looking frozen.
-        _now = _time.time()
-        _phase_remaining = max(0.0, float(scrape_phase.get("until", 0.0)) - _now)
-        _phase_key = scrape_phase.get("key") if scrape_running else None
+        _ctx = _CtxView(bot_data)
+        jobs_registry = _scrape_jobs(_ctx)
+        active_jobs = _active_scrape_jobs(_ctx)
+        # All jobs: active first (oldest first), then last finished
+        job_list = list(active_jobs)
+        finished_jobs = [j for j in jobs_registry.values() if not _job_is_active(j)]
+        if finished_jobs:
+            last_finished = max(finished_jobs,
+                                key=lambda j: j.get("finished_at", 0.0))
+            job_list.append(last_finished)
+        scrape_payloads = [_scrape_job_payload(j) for j in job_list]
+        # Primary job for the legacy `scrape` field: newest active, else
+        # the last finished one (drives the dashboard's "last results").
+        primary = active_jobs[-1] if active_jobs else (
+            job_list[0] if job_list else None)
+        primary_payload = _scrape_job_payload(primary) if primary else {}
+        scrape_running = bool(active_jobs)
 
         # Custom caption
-        from handlers.admin import _get_custom_caption
-        custom_caption = await _get_custom_caption(
-            type("Ctx", (), {"bot_data": bot_data})()
-        )
+        custom_caption = await _get_custom_caption(_ctx)
 
         # Cumulative stats (persisted to SQLite, survive restarts)
         cumulative_stats = {}
@@ -210,31 +228,14 @@ async def _run_polling_with_stats(app: Application, cfg: Config) -> None:
             "destination_is_forum": bot_data.get("destination_is_forum"),
             "custom_caption": custom_caption,
             "scrape_running": scrape_running,
-            "scrape": {
-                "source_ref": scrape_status.get("source_ref"),
-                "dest_label": scrape_status.get("dest_label"),
-                "order": scrape_status.get("order"),
-                "filter": scrape_status.get("filter", "ALL media"),
-                "parallel": scrape_status.get("parallel", config.default_parallel if config else 5),
-                "total_seen": scrape_status.get("total_seen", 0),
-                "sent_count": scrape_status.get("sent_count", 0),
-                "failed_count": scrape_status.get("failed_count", 0),
-                "skipped_count": scrape_status.get("skipped_count", 0),
-                "in_flight": scrape_status.get("in_flight", 0),
-                "last_message_id": scrape_status.get("last_message_id", 0),
-                "flood_waits": scrape_status.get("flood_waits", 0),
-                "started_at": scrape_status.get("started_at"),
-                "elapsed_sec": (_time.time() - scrape_status.get("started_at", 0))
-                                if scrape_status.get("started_at") else 0,
-                # Live wait phase + countdown ("flood" | "break" | null)
-                "phase": _phase_key,
-                "phase_note": scrape_phase.get("note", ""),
-                "phase_seconds_left": round(_phase_remaining, 1) if _phase_key else 0,
-                # Seconds since the last real progress update (liveness)
-                "seconds_since_progress": round(
-                    _now - scrape_status["last_update"], 1
-                ) if scrape_status.get("last_update") else None,
-            },
+            "scrape_jobs_running": len(active_jobs),
+            # One entry per job (active first, then the last finished one).
+            # Each entry carries job_id/kind/running plus the full counter
+            # set, live wait phase + countdown, and the liveness field.
+            "scrapes": scrape_payloads,
+            # Legacy single-job view (newest active, else last finished) —
+            # same schema as each `scrapes` entry, so old dashboards work.
+            "scrape": primary_payload,
             # All-time cumulative stats (persisted across restarts)
             "cumulative": {
                 "total_scrapes": cumulative_stats.get("total_scrapes", 0),
@@ -249,14 +250,39 @@ async def _run_polling_with_stats(app: Application, cfg: Config) -> None:
         return web.json_response(stats)
 
     async def stop_scrape_handler(request: web.Request) -> web.Response:
-        """POST /stop_scrape — triggers the cancel event."""
-        cancel_event = app.bot_data.get("scrape_cancel")
-        task = app.bot_data.get("scrape_task")
-        if not task or task.done():
+        """POST /stop_scrape[?job=J1|all] — stop scrape job(s).
+
+        Query params (optional):
+          job=J1  — stop only that job (also accepts "1", "j1")
+          job=all — stop every running job
+        With no param: stops ALL running jobs (legacy dashboard behavior —
+        there used to be only one scrape at a time).
+        This endpoint only sends the graceful tier-1 cancel signal; the
+        bot command /stop_scrape has the full tiered escalation.
+        """
+        from handlers.admin import _scrape_jobs, _job_is_active
+        arg = request.query.get("job", "").strip()
+        jobs = _scrape_jobs(_CtxView(app.bot_data))
+        active = [j for j in jobs.values() if _job_is_active(j)]
+        if not active:
             return web.json_response({"ok": False, "error": "No active scrape"})
-        if cancel_event:
-            cancel_event.set()
-        return web.json_response({"ok": True, "message": "Stop signal sent"})
+        a = arg.lower()
+        if a in ("", "all", "*"):
+            targets = active
+        else:
+            jid = a if a.startswith("j") else f"j{a}"
+            job = jobs.get(jid.upper())
+            if job is None or not _job_is_active(job):
+                return web.json_response(
+                    {"ok": False, "error": f"No active job matching '{arg}'"})
+            targets = [job]
+        for j in targets:
+            j["cancel_event"].set()
+        return web.json_response({
+            "ok": True,
+            "stopped": [j["job_id"] for j in targets],
+            "message": f"Stop signal sent to {len(targets)} job(s)",
+        })
 
     async def cancel_caption_handler(request: web.Request) -> web.Response:
         """POST /cancel_caption — clears the custom caption."""

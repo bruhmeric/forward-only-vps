@@ -140,6 +140,14 @@ DB_PATH=/app/data/forwarder.db
 # messages so the account-level rate budget fully recovers on long runs.
 # FLOOD_BREAK_EVERY=500
 # FLOOD_BREAK_SECONDS=300
+
+# ── Parallel scrapes ───────────────────────────────────────────────
+# How many scrape jobs (/scrape and/or /scrapeid) may run at the same
+# time. 2 = the classic combo (one /scrapeid + one /scrape). 1 restores
+# the old one-at-a-time behavior. Hard cap 4. All jobs share ONE
+# Telegram account, so the rate budget is shared — more jobs means more
+# frequent (visible) flood waits, not double throughput.
+# MAX_CONCURRENT_SCRAPES=2
 ```
 
 ### Step 4. Start all services

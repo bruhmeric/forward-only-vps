@@ -8,6 +8,7 @@ import json
 import logging
 import os
 from aiohttp import web, ClientSession
+from urllib.parse import quote
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -63,8 +64,14 @@ async def api_stats(request: web.Request) -> web.Response:
 
 
 async def api_stop_scrape(request: web.Request) -> web.Response:
-    """POST /api/stop_scrape — stop the active scrape on the forwarder bot."""
-    result = await post_json(FORWARDER_STOP_SCRAPE_URL)
+    """POST /api/stop_scrape?job=J1|all — stop scrape job(s) on the bot.
+    The optional `job` query param is forwarded verbatim (J1 / 1 / all);
+    without it the bot stops every running scrape."""
+    job = (request.query.get("job") or "").strip()
+    url = FORWARDER_STOP_SCRAPE_URL
+    if job:
+        url += f"?job={quote(job)}"
+    result = await post_json(url)
     return web.json_response(result or {"ok": False, "error": "Failed to reach forwarder bot"})
 
 
@@ -143,6 +150,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         font-weight: 600; text-transform: uppercase; }
         .badge-running { background: #10b981; color: #fff; }
         .badge-idle { background: #2a3142; color: #6b7280; }
+
+        /* One card per concurrent scrape job (e.g. /scrape + /scrapeid) */
+        .job-card { background: #141928; border: 1px solid #2a3142;
+                    border-radius: 10px; padding: 14px; margin-bottom: 12px; }
+        .job-card-header { display: flex; align-items: center; gap: 8px;
+                           flex-wrap: wrap; margin-bottom: 8px; font-size: 13px; }
+        .job-chip { font-size: 11px; font-weight: 700; padding: 2px 8px;
+                    border-radius: 6px; letter-spacing: 0.5px; }
+        .job-chip-id { background: #3b82f6; color: #fff; }
+        .job-chip-kind { background: #2a3142; color: #cbd5e1; }
+        .job-chip-scrapeid { background: #8b5cf6; color: #fff; }
+        .job-meta { color: #8b95a7; font-size: 12.5px; }
 
         .progress-bar-container { background: #0a0e1a; border-radius: 6px; height: 24px;
                                   overflow: hidden; margin: 12px 0; position: relative; }
@@ -351,50 +370,113 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const badge = document.getElementById('scrape-badge');
             const content = document.getElementById('scrape-content');
 
-            if (f.scrape_running) {
+            // Multi-job payload: f.scrapes is an array of job objects.
+            // (Older bots only send the single f.scrape object — wrap it.)
+            let jobs = Array.isArray(f.scrapes) ? f.scrapes.slice() : [];
+            if (!jobs.length && f.scrape && (f.scrape_running || f.scrape.total_seen > 0)) {
+                jobs = [Object.assign({}, f.scrape, {running: !!f.scrape_running})];
+            }
+            const active = jobs.filter(j => j.running);
+
+            if (active.length > 0) {
                 panel.classList.add('active');
                 badge.className = 'scrape-badge badge-running';
-                badge.textContent = 'RUNNING';
+                badge.textContent = active.length > 1
+                    ? 'RUNNING (' + active.length + ')' : 'RUNNING';
+                let html = active.map(jobCard).join('');
+                if (active.length > 1) {
+                    html += '<div class="btn-row"><button class="btn btn-stop" onclick="stopScrape(\'all\')">Stop All Jobs</button></div>';
+                }
+                content.innerHTML = html;
+            } else {
+                panel.classList.remove('active');
+                badge.className = 'scrape-badge badge-idle';
+                badge.textContent = 'IDLE';
+                // Show last scrape results if available
                 const s = f.scrape || {};
-                const pct = s.total_seen > 0 ? (s.sent_count / s.total_seen * 100) : 0;
-                const elapsed = s.elapsed_sec || 0;
-                const speed = elapsed > 0 ? (s.sent_count / (elapsed / 60)).toFixed(1) : 0;
-                const inFlight = s.in_flight || 0;
-
-                // Live wait phase (flood wait / recovery break) with a
-                // ticking countdown — makes long waits clearly visible
-                // instead of looking like a frozen dashboard.
-                let phaseHtml = '';
-                if (s.phase) {
-                    const left = s.phase_seconds_left || 0;
-                    const mm = Math.floor(left / 60), ss = Math.floor(left % 60);
-                    const leftStr = left >= 3600
-                        ? Math.floor(left/3600) + 'h' + String(mm%60).padStart(2,'0') + 'm'
-                        : mm + 'm' + String(ss).padStart(2,'0') + 's';
-                    const label = s.phase === 'break' ? '☕ Recovery break'
-                                : s.phase === 'flood' ? '⏳ Flood wait' : '⏳ ' + s.phase;
-                    const color = s.phase === 'break' ? '#3b82f6' : '#f59e0b';
-                    phaseHtml = `<div style="margin-bottom:8px; color:${color}; font-weight:600; font-size:14px;">${label}: ${leftStr} remaining</div>`;
+                if (s && s.total_seen > 0) {
+                    content.innerHTML = `
+                        <div style="color:#8b95a7; font-size:13px; margin-bottom:10px;">Last scrape results${s.job_id ? ' — ' + esc(s.job_id) + (s.kind ? ' (/' + esc(s.kind) + ')' : '') : ''}:</div>
+                        <div class="live-stats">
+                            <div class="live-stat"><div class="num" style="color:#10b981">${s.sent_count || 0}</div><div class="lbl">Sent</div></div>
+                            <div class="live-stat"><div class="num" style="color:#ef4444">${s.failed_count || 0}</div><div class="lbl">Failed</div></div>
+                            <div class="live-stat"><div class="num" style="color:#f59e0b">${s.skipped_count || 0}</div><div class="lbl">Skipped</div></div>
+                            <div class="live-stat"><div class="num">${s.total_seen || 0}</div><div class="lbl">Seen</div></div>
+                            <div class="live-stat"><div class="num">${Math.floor(s.elapsed_sec || 0)}s</div><div class="lbl">Elapsed</div></div>
+                        </div>
+                        <div style="color:#6b7280; font-size:12px; margin-top:8px;">Source: ${esc(s.source_ref || '?')} → ${esc(s.dest_label || '?')}</div>
+                    `;
+                } else {
+                    content.innerHTML = `
+                        <div class="empty-state">
+                            <div class="icon">💤</div>
+                            <div>No scrape has been run yet</div>
+                            <div style="font-size:12px; margin-top:8px; color:#4b5563;">
+                                Send /scrape &lt;url&gt; to the bot to start
+                            </div>
+                        </div>
+                    `;
                 }
+            }
+        }
 
-                // Liveness: how long since the last real progress update
-                let livenessHtml = '';
-                if (s.seconds_since_progress != null && s.seconds_since_progress > 30) {
-                    livenessHtml = `<div style="margin-bottom:8px; color:#6b7280; font-size:12px;">Last progress ${Math.floor(s.seconds_since_progress)}s ago</div>`;
-                }
+        function esc(s) {
+            return String(s == null ? '' : s)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
 
-                let activity = 'Scanning...';
-                if (s.phase === 'flood') activity = 'Flood wait — auto-resumes';
-                else if (s.phase === 'break') activity = 'Recovery break — auto-resumes';
-                else if (inFlight > 0) activity = 'Sending ' + inFlight + ' item(s)...';
-                else if (s.flood_waits > 0) activity = 'Flood wait...';
+        function fmtLeft(left) {
+            left = Math.max(0, Math.floor(left || 0));
+            if (left >= 3600) return Math.floor(left / 3600) + 'h' + String(Math.floor((left % 3600) / 60)).padStart(2, '0') + 'm';
+            if (left >= 60) return Math.floor(left / 60) + 'm' + String(left % 60).padStart(2, '0') + 's';
+            return left + 's';
+        }
 
-                content.innerHTML = `
-                    <div style="margin-bottom:12px; color:#8b95a7; font-size:13px;">
-                        <strong>Source:</strong> ${s.source_ref || '?'} &nbsp;|&nbsp;
-                        <strong>Dest:</strong> ${s.dest_label || '?'} &nbsp;|&nbsp;
-                        <strong>Order:</strong> ${s.order || '?'} &nbsp;|&nbsp;
-                        <strong>Filter:</strong> ${s.filter || 'ALL'} &nbsp;|&nbsp;
+        // One card per scrape job — each job (a /scrape and/or a
+        // /scrapeid running concurrently) gets its own activity line,
+        // live wait-phase countdown, progress bar, counters, and Stop button.
+        function jobCard(s) {
+            const jid = esc(s.job_id || '');
+            const kind = s.kind === 'scrapeid' ? 'scrapeid' : (s.kind || 'scrape');
+            const pct = s.total_seen > 0 ? (s.sent_count / s.total_seen * 100) : 0;
+            const elapsed = s.elapsed_sec || 0;
+            const speed = elapsed > 0 ? (s.sent_count / (elapsed / 60)).toFixed(1) : 0;
+            const inFlight = s.in_flight || 0;
+
+            // Live wait phase (flood wait / recovery break) with a
+            // ticking countdown — makes long waits clearly visible
+            // instead of looking like a frozen dashboard.
+            let phaseHtml = '';
+            if (s.phase) {
+                const label = s.phase === 'break' ? '☕ Recovery break'
+                            : s.phase === 'flood' ? '⏳ Flood wait' : '⏳ ' + esc(s.phase);
+                const color = s.phase === 'break' ? '#3b82f6' : '#f59e0b';
+                phaseHtml = `<div style="margin-bottom:8px; color:${color}; font-weight:600; font-size:14px;">${label}: ${fmtLeft(s.phase_seconds_left)} remaining</div>`;
+            }
+
+            // Liveness: how long since the last real progress update
+            let livenessHtml = '';
+            if (s.seconds_since_progress != null && s.seconds_since_progress > 30) {
+                livenessHtml = `<div style="margin-bottom:8px; color:#6b7280; font-size:12px;">Last progress ${Math.floor(s.seconds_since_progress)}s ago</div>`;
+            }
+
+            let activity = 'Scanning...';
+            if (s.phase === 'flood') activity = 'Flood wait — auto-resumes';
+            else if (s.phase === 'break') activity = 'Recovery break — auto-resumes';
+            else if (inFlight > 0) activity = 'Sending ' + inFlight + ' item(s)...';
+
+            return `
+                <div class="job-card">
+                    <div class="job-card-header">
+                        <span class="job-chip job-chip-id">${jid}</span>
+                        <span class="job-chip job-chip-${kind}">/${kind}</span>
+                        <span class="job-meta">${esc(s.source_ref || '?')} → ${esc(s.dest_label || '?')}</span>
+                    </div>
+                    <div style="color:#8b95a7; font-size:12.5px; margin-bottom:6px;">
+                        <strong>Order:</strong> ${esc(s.order || '?')} &nbsp;|&nbsp;
+                        <strong>Filter:</strong> ${esc(s.filter || 'ALL')} &nbsp;|&nbsp;
                         <strong>Parallel:</strong> ${s.parallel || 5}
                     </div>
                     <div style="margin-bottom:8px; color:#10b981; font-weight:600; font-size:14px;">${activity}</div>
@@ -415,44 +497,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         <div class="live-stat"><div class="num">${s.last_message_id || 0}</div><div class="lbl">Last ID</div></div>
                     </div>
                     <div class="btn-row">
-                        <button class="btn btn-stop" onclick="stopScrape()">Stop Scrape</button>
+                        <button class="btn btn-stop" onclick="stopScrape('${jid}')">Stop ${jid}</button>
                     </div>
-                `;
-            } else {
-                panel.classList.remove('active');
-                badge.className = 'scrape-badge badge-idle';
-                badge.textContent = 'IDLE';
-                // Show last scrape results if available
-                const s = f.scrape || {};
-                if (s && s.total_seen > 0) {
-                    content.innerHTML = `
-                        <div style="color:#8b95a7; font-size:13px; margin-bottom:10px;">Last scrape results:</div>
-                        <div class="live-stats">
-                            <div class="live-stat"><div class="num" style="color:#10b981">${s.sent_count || 0}</div><div class="lbl">Sent</div></div>
-                            <div class="live-stat"><div class="num" style="color:#ef4444">${s.failed_count || 0}</div><div class="lbl">Failed</div></div>
-                            <div class="live-stat"><div class="num" style="color:#f59e0b">${s.skipped_count || 0}</div><div class="lbl">Skipped</div></div>
-                            <div class="live-stat"><div class="num">${s.total_seen || 0}</div><div class="lbl">Seen</div></div>
-                            <div class="live-stat"><div class="num">${Math.floor(s.elapsed_sec || 0)}s</div><div class="lbl">Elapsed</div></div>
-                        </div>
-                        <div style="color:#6b7280; font-size:12px; margin-top:8px;">Source: ${s.source_ref || '?'} → ${s.dest_label || '?'}</div>
-                    `;
-                } else {
-                    content.innerHTML = `
-                        <div class="empty-state">
-                            <div class="icon">💤</div>
-                            <div>No scrape has been run yet</div>
-                            <div style="font-size:12px; margin-top:8px; color:#4b5563;">
-                                Send /scrape &lt;url&gt; to the bot to start
-                            </div>
-                        </div>
-                    `;
-                }
-            }
+                </div>
+            `;
         }
 
-        async function stopScrape() {
+        async function stopScrape(jobId) {
             try {
-                await fetch('/api/stop_scrape', { method: 'POST' });
+                const url = jobId
+                    ? '/api/stop_scrape?job=' + encodeURIComponent(jobId)
+                    : '/api/stop_scrape';
+                await fetch(url, { method: 'POST' });
                 setTimeout(fetchStats, 500);
             } catch (e) { console.error(e); }
         }
