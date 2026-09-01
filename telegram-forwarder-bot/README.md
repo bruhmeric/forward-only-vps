@@ -206,6 +206,35 @@ Guard rails:
 
 ---
 
+## Flood-wait cap (10 minutes)
+
+No single server-requested FloodWait is slept in full beyond
+**`FLOOD_WAIT_MAX_SECONDS`** (default `600` = 10 minutes). Telegram's
+big-scrape floods often demand 15–30+ minutes in one go; instead of
+freezing for the whole request, the bot:
+
+1. sleeps at most the cap (with a live countdown in the status message
+   and dashboard),
+2. retries the request early,
+3. caps the server's (now smaller) remaining answer again, and repeats
+   until Telegram lets the request through.
+
+A milestone message announces each capped retry ("server asked 1800s —
+sleeping only 600s, then RETRYING early"), so counters, countdowns and
+`/stop_scrape` keep cycling at least every 10 minutes instead of the
+page looking frozen for half an hour. Capped retries get their own
+generous budget (~5 h) so early retries never kill a healthy run.
+
+```env
+FLOOD_WAIT_MAX_SECONDS=600   # 10 min; 0 = sleep exactly what the server asks
+```
+
+Set it in `.env`. Applies to every flood handler: reads (`get_messages`),
+forward batches (`forward_messages`), single sends, and the internal
+forward/send retries inside protected-content fallbacks.
+
+---
+
 ## Captions
 
 By default, the bot preserves original captions when forwarding. You can change this:

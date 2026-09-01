@@ -136,6 +136,15 @@ DB_PATH=/app/data/forwarder.db
 # to 24h (the scrape still survives, but it looks completely stuck).
 # FLOOD_SLEEP_THRESHOLD=60
 
+# Cap on any SINGLE server-requested flood wait (seconds). Telegram often
+# demands 15-30+ minute waits on big scrapes. Instead of sleeping the
+# whole thing, the bot sleeps at most this long, then RETRIES early —
+# the server answers with the (now smaller) remaining wait, which is
+# capped again. Counters, live countdowns and /stop_scrape keep cycling
+# at least every cap instead of freezing. Default 600 = 10 minutes.
+# Set 0 to sleep exactly what the server asks (old behavior).
+# FLOOD_WAIT_MAX_SECONDS=600
+
 # Extended human-like break: pause this many seconds after every N sent
 # messages so the account-level rate budget fully recovers on long runs.
 # FLOOD_BREAK_EVERY=500
@@ -395,14 +404,15 @@ PARALLEL=8
 `/scrapeid` is tuned to run flood-free by default — no tuning needed:
 - 100 messages per API call (Telegram's max)
 - 3.5 s adaptive, **randomly-jittered** delay between batches (~1,700 msgs/min sustained, under the ~30 msgs/s account budget) — the jitter keeps the traffic pattern from looking metronomic/bot-like
-- On FloodWait: sleeps the requested time, retries the same batch, and increases the delay — never loses messages, never dies
+- On FloodWait: sleeps the requested time (capped at 10 minutes — longer waits are retried early), retries the same batch, and increases the delay — never loses messages, never dies
 - Transient non-flood errors (timeouts, RPC hiccups) get exponential backoff (1s → 2s → 4s) before a batch is counted as failed
 
 ### Flood resilience — how it all fits together
 
 The bot uses a layered, Telethon-first strategy:
 
-1. **Telethon built-in auto-handling** — the client is created with `flood_sleep_threshold=60`: every FloodWait/SlowModeWait ≤ 60s is silently slept off and retried *inside the library*. Longer waits raise FloodWaitError to the bot, which **shows a live countdown** (status message + dashboard + `/scrape_status`), sleeps the requested time in cancel-aware chunks, and retries the same batch — so long waits are resilient AND visible. (⚠️ `None` is NOT "wait forever" — Telethon converts it to 0, which raises every flood immediately. And 86400, while survivable, makes every wait invisible for up to 24h — the bot then looks frozen during long flood waits, which is exactly the "stuck at budget recovery" symptom.)
+1. **Telethon built-in auto-handling** — the client is created with `flood_sleep_threshold=60`: every FloodWait/SlowModeWait ≤ 60s is silently slept off and retried *inside the library*. Longer waits raise FloodWaitError to the bot, which **shows a live countdown** (status message + dashboard + `/scrape_status`), sleeps in cancel-aware chunks, and retries the same batch — so long waits are resilient AND visible. (⚠️ `None` is NOT "wait forever" — Telethon converts it to 0, which raises every flood immediately. And 86400, while survivable, makes every wait invisible for up to 24h — the bot then looks frozen during long flood waits, which is exactly the "stuck at budget recovery" symptom.)
+1b. **Flood-wait cap (10 minutes)** — Telegram's big-scrape floods often demand 15–30+ minutes in one go. The bot refuses to freeze that long in a single sleep: any server-requested wait longer than `FLOOD_WAIT_MAX_SECONDS` (default 600s = 10 min) is truncated, the request is retried early, and the server's (now smaller) remaining wait is capped again. Counters, countdowns and `/stop_scrape` keep cycling at least every 10 minutes; a milestone message announces each capped retry ("server asked 1800s — sleeping only 600s, then RETRYING early"). Capped retries have their own generous budget (`_MAX_CAPPED_CYCLES`, ~5h) so early retries never kill an otherwise healthy run.
 2. **Adaptive pacing** — an `AdaptivePacer` grows the inter-batch delay whenever a FloodWait still leaks through, and relaxes it after a streak of clean batches.
 3. **Human-like jitter** — every inter-batch delay is randomized to 75–160% of the pacer value, so the request pattern isn't metronomic.
 4. **Extended breaks** — after every 500 sent messages (configurable: `FLOOD_BREAK_EVERY` / `FLOOD_BREAK_SECONDS`), the bot pauses 5 minutes so the account-level budget fully recovers, like a human taking a break. The status message and dashboard show a **live countdown** during the break ("[RECOVERY BREAK] 4m12s remaining"), and `/stop_scrape` works throughout.
@@ -491,10 +501,22 @@ telegram-forwarder-vps/
 - Check logs: `docker-compose logs forwarder-bot`
 - The dashboard queries internal Docker DNS (`forwarder-bot`) — this only works when both containers are on the same `bots-network`
 
+### "Dashboard doesn't update"
+
+First check the **build pill** next to the status dot (top of the page) — it shows the code build the *bot container* is running.
+
+- **No pill / a yellow banner mentioning a rebuild** → the bot container is running an OLD image. `docker-compose up -d` does **not** rebuild changed code — always deploy with:
+  ```bash
+  docker-compose up -d --build
+  ```
+  A stale image predates the live countdowns, concurrent job cards and the 10-minute flood-wait cap, so an old bot genuinely looks frozen during long flood waits even though the dashboard code is new.
+- **Pill matches but data frozen** → check `docker-compose logs dashboard` and `docker-compose logs forwarder-bot`; the page keeps showing the last good data with an amber "Bot slow" pill for up to 15s during transient fetch failures — if it flips fully to "Bot Offline", the bot's /stats endpoint (port 8081) is not answering.
+- **During a flood wait** — counters intentionally pause while the `[FLOOD WAIT]` countdown ticks down; with the 10-minute cap, a milestone "RETRYING early" message appears at most every 10 minutes. That is the bot working as designed, not a freeze.
+
 ### `/scrape` hits FloodWait on big channels
 
 This used to be a hard failure around ~1800–2000 messages. It is now handled by the layered flood strategy (see "Flood resilience" above):
-- Flood waits ≤ 60s are auto-slept inside Telethon; longer waits surface to the bot, which displays a **live countdown** in the status message and dashboard, sleeps the requested time, and retries the same batch — the scrape keeps going and you can see exactly when it will resume
+- Flood waits ≤ 60s are auto-slept inside Telethon; longer waits surface to the bot, which displays a **live countdown** in the status message and dashboard and retries the same batch. Waits **longer than 10 minutes** (`FLOOD_WAIT_MAX_SECONDS`) are capped: the bot sleeps at most 10 minutes, retries early, and caps the server's (smaller) remaining answer again — the scrape keeps going and you can see exactly when it will resume
 - Read pacing (getHistory) keeps safely under Telegram's ~10 req/30 s budget with headroom, with random human-like jitter
 - Send-side FloodWaits are slept off and retried — they no longer fall into the slow re-upload fallback
 - An adaptive pacer slows reads/sends after any FloodWait and speeds back up once quiet

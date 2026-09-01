@@ -120,6 +120,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "\n*Parallel scrapes:* up to 2 jobs can run at once — e.g. one "
         "/scrapeid + one /scrape on different channels. Each gets its own "
         "live status message.\n"
+        "\n*Flood waits:* long Telegram waits are capped at 10 minutes "
+        "(FLOOD_WAIT_MAX_SECONDS) — the status line shows a live countdown "
+        "and retries automatically. Recovery breaks of 5 minutes are taken "
+        "every 500 messages.\n"
         "/caption <text>  — 📝 set a custom caption (replaces original)\n"
         "/caption strip   — 📝 strip ALL captions from forwarded media\n"
         "/caption clear   — 📝 restore original captions\n"
@@ -1080,7 +1084,9 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
       - If no media type filter is given, ALL media is forwarded
       - Text-only messages are always skipped (they have no media)
       - Rate limit: 0.3 sec delay between sends (per parallel slot)
-      - On FloodWait, the bot sleeps and retries automatically
+      - On FloodWait, the bot sleeps and retries automatically (waits
+        longer than 10 minutes are capped — FLOOD_WAIT_MAX_SECONDS — and
+        retried early with a live countdown)
       - Protected (noforwards) channels use the same three-tier fallback
         as /saved — forward → send_message(file=) → download+send_file
     """
@@ -1915,12 +1921,13 @@ async def cmd_reconnect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         except Exception:
             pass
 
-    # Create and start a new session
+    # Create and start the new session
     from user_session import UserSession
     new_session = UserSession(
         cfg.session_name, cfg.api_id, cfg.api_hash,
         session_string=cfg.session_string,
         flood_sleep_threshold=cfg.flood_sleep_threshold,
+        flood_wait_cap=getattr(cfg, "flood_wait_cap", 600),
     )
     ok = await new_session.start()
     if ok:

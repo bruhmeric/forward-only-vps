@@ -26,15 +26,31 @@ FORWARDER_RESET_STATS_URL = os.environ.get("FORWARDER_RESET_STATS_URL",
 
 DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8080"))
 
+# Build of the forwarder-bot code this dashboard expects (kept in sync
+# with telegram_forwarder-bot/config.py CODE_VERSION — bump both
+# together). The bot reports its own `build` in /stats; a mismatch means
+# one container is running stale code (classic cause of "dashboard
+# doesn't update": docker-compose up -d was run WITHOUT --build) and the
+# dashboard shows a rebuild banner.
+EXPECTED_BOT_BUILD = "v5"
 
-async def fetch_json(url: str, timeout: float = 3.0) -> dict | None:
+# Shared outbound HTTP session (reused across polls instead of a new
+# connection every 3s) and a generous timeout: a busy bot can take a
+# few seconds to answer /stats while a scrape is running, and the old
+# 3-second timeout flipped the whole page to "Bot Offline".
+_client_session: ClientSession | None = None
+
+
+async def fetch_json(url: str, timeout: float = 8.0) -> dict | None:
     """Fetch JSON from a URL with a short timeout. Returns None on error."""
+    global _client_session
     try:
-        async with ClientSession() as session:
-            async with session.get(url, timeout=timeout) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                return None
+        if _client_session is None or _client_session.closed:
+            _client_session = ClientSession()
+        async with _client_session.get(url, timeout=timeout) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            return None
     except Exception:
         return None
 
@@ -206,6 +222,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         .empty-state { text-align: center; padding: 40px; color: #6b7280; }
         .empty-state .icon { font-size: 48px; margin-bottom: 12px; }
+
+        /* Version-mismatch banner (stale docker image warning) */
+        #version-banner { max-width: 1200px; margin: 0 auto 20px; padding: 14px 18px;
+                         background: #3b2a10; border: 1px solid #f59e0b; border-radius: 10px;
+                         color: #fcd34d; font-size: 13.5px; line-height: 1.6; }
+        #version-banner code { background: #1a1f2e; padding: 2px 7px; border-radius: 5px;
+                              font-size: 12.5px; color: #fde68a; }
+        .status-dot.status-stale { background: #f59e0b; box-shadow: 0 0 8px #f59e0b; }
     </style>
 </head>
 <body>
@@ -223,7 +247,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <span class="status-dot status-unknown" id="telethon-dot"></span>
             <span>Telethon: <span id="telethon-status">?</span></span>
         </div>
+        <div class="status-pill" id="build-pill" style="display:none">
+            <span id="build-pill-text">build ?</span>
+        </div>
     </div>
+
+    <!-- Version mismatch / stale-image warning: shown when the bot's
+         reported `build` differs from EXPECTED_BOT_BUILD above. -->
+    <div id="version-banner" style="display:none"></div>
 
     <div class="container">
         <!-- All-Time Stats -->
@@ -296,25 +327,106 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
 
     <script>
+        const EXPECTED_BOT_BUILD = 'v5';
+        // Last good /stats payload + when it arrived. On transient fetch
+        // failures we keep rendering it (with a "reconnecting" pill) for
+        // up to 15s instead of instantly blanking everything to "Bot
+        // Offline" — a busy bot can be slow, and the page flipping fully
+        // offline on one slow poll LOOKS like "dashboard doesn't update".
+        let lastGood = null, lastGoodAt = 0;
+        const STALE_GRACE_MS = 15000;
+
+        // Run one update section; a failure in one section must never
+        // block the others (a JS error in updateScrape used to abort the
+        // whole tick, freezing the footer timestamp too).
+        function safe(fn, ...args) {
+            try { fn(...args); } catch (e) { console.error(fn.name, e); }
+        }
+
         async function fetchStats() {
             try {
                 const resp = await fetch('/api/stats');
                 const data = await resp.json();
-                updateBot(data);
-                updateCumulative(data);
-                updateScrape(data);
-                document.getElementById('last-update').textContent =
-                    new Date().toLocaleTimeString();
+                if (data.forwarder_online) {
+                    lastGood = data;
+                    lastGoodAt = Date.now();
+                    render(data, false);
+                } else if (lastGood && Date.now() - lastGoodAt < STALE_GRACE_MS) {
+                    render(lastGood, true);
+                } else {
+                    render(data, false);
+                }
             } catch (e) {
+                // /api/stats itself unreachable — reuse recent good data
+                if (lastGood && Date.now() - lastGoodAt < STALE_GRACE_MS) {
+                    render(lastGood, true);
+                } else {
+                    render({ forwarder_online: false, forwarder: null }, false);
+                }
                 console.error('Fetch failed:', e);
             }
         }
 
-        function updateBot(data) {
+        function render(data, stale) {
+            safe(updateVersionBanner, data);
+            safe(updateBot, data, stale);
+            safe(updateCumulative, data);
+            safe(updateScrape, data);
+            if (!stale) {
+                document.getElementById('last-update').textContent =
+                    new Date().toLocaleTimeString();
+            }
+        }
+
+        function updateVersionBanner(data) {
+            const banner = document.getElementById('version-banner');
+            const pill = document.getElementById('build-pill');
+            const pillText = document.getElementById('build-pill-text');
+            const f = data.forwarder || {};
+            const build = f.build;
+            if (build) {
+                pill.style.display = '';
+                pillText.textContent = 'bot build: ' + build;
+            }
+            if (!data.forwarder_online) {
+                banner.style.display = 'none';
+                return;
+            }
+            if (!build) {
+                // Bot predates the `build` field — definitely an old image.
+                banner.style.display = 'block';
+                banner.innerHTML =
+                    '⚠️ The bot does not report a code build — it is running an <b>old image</b> ' +
+                    'and will not show live countdowns, concurrent jobs or the 10-minute ' +
+                    'flood-wait cap. On the VPS run:<br>' +
+                    '<code>docker-compose up -d --build</code> ' +
+                    '(a plain <code>up -d</code> does NOT rebuild changed code).';
+            } else if (build !== EXPECTED_BOT_BUILD) {
+                banner.style.display = 'block';
+                banner.innerHTML =
+                    '⚠️ Version mismatch: bot reports build <b>' + esc(build) + '</b> but this ' +
+                    'dashboard expects <b>' + EXPECTED_BOT_BUILD + '</b>. One container is ' +
+                    'running stale code — rebuild BOTH on the VPS:<br>' +
+                    '<code>docker-compose up -d --build</code>';
+            } else {
+                banner.style.display = 'none';
+            }
+        }
+
+        function updateBot(data, stale) {
             const dot = document.getElementById('bot-dot');
             const text = document.getElementById('bot-status-text');
             const tDot = document.getElementById('telethon-dot');
             const tStatus = document.getElementById('telethon-status');
+
+            if (stale) {
+                // Recent good data being reused while a poll failed —
+                // amber pill instead of a full offline flip.
+                dot.className = 'status-dot status-stale';
+                const age = Math.floor((Date.now() - lastGoodAt) / 1000);
+                text.textContent = 'Bot slow — showing ' + age + 's-old data';
+                return;
+            }
 
             if (!data.forwarder_online) {
                 dot.className = 'status-dot status-offline';

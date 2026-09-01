@@ -16,6 +16,15 @@ import os
 from dataclasses import dataclass, field
 from typing import Optional
 
+# Code version of the forwarder-bot package. Bumped on every behavior
+# change. The /stats endpoint reports it as `build` and the dashboard
+# compares it against its own expected build — if they don't match, the
+# dashboard shows a "rebuild your containers" banner. This exists because
+# the most common "dashboard doesn't update" report turned out to be a
+# stale docker image (docker-compose up -d WITHOUT --build) still running
+# the old code.
+CODE_VERSION = "v5"
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -64,6 +73,15 @@ class Config:
     # NOTE: None/0 does NOT mean "wait forever" — Telethon's setter turns
     # None into 0, which RAISES every FloodWaitError instead.
     flood_sleep_threshold: int = 60
+    # Max time (seconds) we will sleep on ANY single server-requested
+    # FloodWait before retrying the request. Telegram often demands
+    # 15-30+ minute waits on big scrapes; instead of silently sleeping the
+    # whole thing, we sleep at most this long and then RETRY — the server
+    # re-answers with the (now smaller) remaining wait, which we again cap.
+    # Counters therefore resume moving (and the countdown keeps ticking)
+    # at least every 10 minutes instead of freezing for half an hour.
+    # 0 disables the cap (sleep the exact server-requested time).
+    flood_wait_cap: int = 600
     # Human-like pacing: take an extended break after this many sent
     # messages (0 disables), lasting flood_break_seconds.
     flood_break_every: int = 500
@@ -119,6 +137,7 @@ class Config:
 
         # Flood resilience knobs (see dataclass docs above)
         flood_sleep_threshold = _env_int("FLOOD_SLEEP_THRESHOLD", 60, 0, 24 * 60 * 60)
+        flood_wait_cap = _env_int("FLOOD_WAIT_MAX_SECONDS", 600, 0, 24 * 60 * 60)
         flood_break_every = _env_int("FLOOD_BREAK_EVERY", 500)
         flood_break_seconds = _env_int("FLOOD_BREAK_SECONDS", 300, 0, 24 * 60 * 60)
 
@@ -141,6 +160,7 @@ class Config:
             session_string=session_string,
             default_parallel=default_parallel,
             flood_sleep_threshold=flood_sleep_threshold,
+            flood_wait_cap=flood_wait_cap,
             flood_break_every=flood_break_every,
             flood_break_seconds=flood_break_seconds,
             max_concurrent_scrapes=max_concurrent_scrapes,

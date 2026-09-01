@@ -234,7 +234,8 @@ def _clear_phase(phase_state) -> None:
 
 async def _wait_visible(seconds, cancel_event=None, phase_state=None,
                          phase_key: str = "flood", status_callback=None,
-                         announce: str | None = None, chunk: float = 5.0) -> bool:
+                         announce: str | None = None, chunk: float = 5.0,
+                         cap: float | None = None) -> bool:
     """Sleep `seconds` with LIVE status visibility.
 
     Combines everything a long server-requested wait needs:
@@ -243,9 +244,17 @@ async def _wait_visible(seconds, cancel_event=None, phase_state=None,
          countdown while we sleep
       3. chunked, cancel-aware sleeping (/stop_scrape works mid-wait)
 
-    Returns True if the full wait elapsed, False if cancelled mid-wait.
+    `cap` (seconds): if the requested sleep exceeds this, sleep only the
+    cap instead — the caller then RETRIES the request early and the server
+    re-answers with the (now smaller) remaining wait. This keeps counters,
+    countdowns and /stop_scrape responsiveness cycling at least every cap
+    instead of freezing for a full 15-30+ minute server-requested wait.
+
+    Returns True if the (possibly capped) wait elapsed, False if cancelled.
     """
     seconds = max(0.0, float(seconds or 0))
+    if cap and cap > 0 and seconds > cap:
+        seconds = float(cap)
     if seconds <= 0:
         return True
     _set_phase(phase_state, phase_key, seconds, announce or phase_key)
@@ -258,6 +267,13 @@ async def _wait_visible(seconds, cancel_event=None, phase_state=None,
         return await _sleep_chunks(seconds, cancel_event, chunk=chunk)
     finally:
         _clear_phase(phase_state)
+
+
+# Safety valve for capped flood-wait cycles (see UserSession._flood_sleep):
+# a single batch may retry early at the 10-minute cap at most this many
+# times (= 5 hours) before we declare the flood unbeatable and give up
+# cleanly instead of looping forever.
+_MAX_CAPPED_CYCLES = 30
 
 
 class BreakScheduler:
@@ -349,7 +365,8 @@ def _forward_kwargs(drop_author: bool, drop_media_captions: bool) -> dict:
 class UserSession:
     def __init__(self, session_name: str, api_id: int, api_hash: str,
                  session_string: Optional[str] = None,
-                 flood_sleep_threshold: int = 60) -> None:
+                 flood_sleep_threshold: int = 60,
+                 flood_wait_cap: float = 600.0) -> None:
         """Create a Telethon client backed by either a file-based session
         (session_name) or a StringSession (session_string). StringSession is
         preferred for ephemeral filesystems like Render's free tier.
@@ -374,7 +391,20 @@ class UserSession:
             (NOT recommended: during multi-hour flood waits nothing updates
             and the bot looks completely stuck — the exact "stuck at budget
             recovery" bug this default fixes).
+
+        flood_wait_cap (seconds, default 600 = 10 minutes):
+            No single server-requested FloodWait is slept in full beyond
+            this cap. Telegram routinely demands 15-30+ minute waits on
+            big scrapes; instead of freezing for the whole request, we
+            sleep at most the cap and then RETRY — the server answers
+            with the (now smaller) remaining wait, which we cap again.
+            Counters, live countdowns and /stop_scrape keep cycling at
+            least every 10 minutes. 0 disables (sleep exactly what the
+            server asked — the old behavior).
         """
+        # Per-request FloodWait sleep cap (see _flood_sleep). Kept as an
+        # attribute so every flood handler in this class shares it.
+        self.flood_wait_cap = max(0.0, float(flood_wait_cap or 0))
         client_kwargs = dict(
             api_id=api_id,
             api_hash=api_hash,
@@ -823,6 +853,57 @@ class UserSession:
 
         return result
 
+    # ---------- flood-wait sleeping (capped, visible) ----------
+
+    async def _flood_sleep(self, seconds: float, cancel_event=None,
+                           phase_state=None, status_callback=None,
+                           where: str = "", buffer: float = 2.0) -> tuple[bool, bool]:
+        """Sleep off ONE server-requested FloodWait, capped at
+        self.flood_wait_cap, with a live countdown + one announcement.
+
+        Telegram's big-scrape floods typically demand 15-30+ minutes. The
+        cap (default 10 min, FLOOD_WAIT_MAX_SECONDS) means we sleep at
+        most that long, then retry the request — the server re-answers
+        with the (now smaller) remaining wait, which we cap again. The
+        status message + dashboard keep cycling instead of freezing, and
+        the milestone announce tells the user exactly what happened.
+
+        Args:
+          seconds: the server-requested wait (FloodWaitError.seconds)
+          where: short label for the announcement ("get_messages", "send")
+          buffer: extra seconds added on top of the requested wait
+
+        Returns (ready, capped):
+          ready  — True = slept, retry now; False = cancelled mid-wait
+          capped — True = the wait was truncated at the cap (budget as a
+                   CAPPED cycle at the call site — capped cycles get their
+                   own generous budget so early retries don't kill the run)
+        """
+        cap = float(getattr(self, "flood_wait_cap", 0) or 0)
+        wait = float(seconds or 0) + buffer
+        capped = cap > 0 and wait > cap
+        if capped:
+            wait = cap
+        announce = None
+        if status_callback:
+            if capped:
+                announce = (
+                    f"⏳ Flood wait on {where or 'request'}: server asked "
+                    f"{int(seconds)}s — sleeping only {int(wait)}s (10-minute "
+                    f"cap), then RETRYING early.\n"
+                    f"   The countdown ticks live in the status line; "
+                    f"/stop_scrape works."
+                )
+            else:
+                announce = (
+                    f"⏳ Flood wait on {where or 'request'}: sleeping "
+                    f"{int(wait)}s — a live countdown is shown in the "
+                    f"status line; /stop_scrape works."
+                )
+        ready = await _wait_visible(wait, cancel_event, phase_state, "flood",
+                                    status_callback, announce=announce)
+        return ready, capped
+
     # ---------- direct send to destination (NEW — fast path) ----------
 
     async def send_to_destination(
@@ -972,17 +1053,23 @@ class UserSession:
                                 f"forwarded to destination")
                     return True, diag
                 except FloodWaitError as fw_err:
+                    # 4 tries covers one full 30-minute server flood at the
+                    # 10-minute cap (3 capped cycles + the succeeding retry);
+                    # a deeper flood re-raises so the caller's (richer) flood
+                    # handling takes over.
                     forward_flood_tries += 1
-                    if forward_flood_tries > 2:
+                    if forward_flood_tries > 4:
                         raise  # persistent flood — let the caller handle it
                     diag.append(
                         f"⏳ FloodWait {fw_err.seconds}s on true forward — sleeping and "
-                        f"retrying ({forward_flood_tries}/2); NOT falling back to re-upload"
+                        f"retrying ({forward_flood_tries}/4); NOT falling back to re-upload"
                     )
                     # Visible wait: publishes a live countdown to the status
-                    # ticker / dashboard instead of sleeping invisibly.
-                    await _wait_visible(float(fw_err.seconds) + 2,
-                                        phase_state=phase_state, phase_key="flood")
+                    # ticker / dashboard, CAPPED at flood_wait_cap (10 min) —
+                    # then retries early instead of freezing for half an hour.
+                    await self._flood_sleep(float(fw_err.seconds),
+                                            phase_state=phase_state,
+                                            where="true forward")
                 except Exception as forward_err:
                     diag.append(f"⚠ True forward failed: {type(forward_err).__name__}: {forward_err}")
                     diag.append("  → Falling back to copy-and-resend (for protected content)")
@@ -1092,16 +1179,19 @@ class UserSession:
                                     f"(type: {type(msg.media).__name__ if msg.media else 'text'})")
                         break
                     except FloodWaitError as fw_err:
+                        # 4 tries = one full 30-min server flood at the 10-min
+                        # cap; deeper floods re-raise to the caller.
                         send_flood_tries += 1
-                        if send_flood_tries > 2:
+                        if send_flood_tries > 4:
                             raise  # persistent — outer handler re-raises to caller
                         diag.append(
                             f"⏳ FloodWait {fw_err.seconds}s on send_message — sleeping and "
-                            f"retrying ({send_flood_tries}/2)"
+                            f"retrying ({send_flood_tries}/4)"
                         )
-                        await _wait_visible(float(fw_err.seconds) + 2,
-                                            phase_state=phase_state,
-                                            phase_key="flood")
+                        # Capped, visible wait (live countdown; 10-min cap).
+                        await self._flood_sleep(float(fw_err.seconds),
+                                                phase_state=phase_state,
+                                                where="send_message")
             except FloodWaitError:
                 # Persistent flood — abort the whole send so the caller can
                 # apply its own backoff. Falling through to Step 3 (full
@@ -1930,71 +2020,65 @@ class UserSession:
             send_to_destination to avoid re-fetching it via get_messages.
 
             NEVER raises — all exceptions are caught and counted as failures.
-            This ensures one bad message doesn't stop the entire scrape."""
+            This ensures one bad message doesn't stop the entire scrape.
+
+            FloodWait handling: each wait is CAPPED at self.flood_wait_cap
+            (default 10 min) and the send retried — up to 4 flood cycles at
+            THIS level (send_to_destination retries internally too). The
+            old code slept the FULL server request (often 15-30 min) exactly
+            once; this loop keeps the countdown and /stop_scrape cycling and
+            resumes sending as soon as Telegram lets us."""
             result["in_flight"] += 1
             try:
                 # Check cancellation before sending
                 if cancel_event and cancel_event.is_set():
                     return False
 
-                # Use a timeout so a stuck send doesn't block the scrape forever.
-                success, _ = await _asyncio.wait_for(
-                    self.send_to_destination(
-                        source_chat_id=source_entity,  # cached entity, not chat_ref
-                        source_message_ids=[msg.id],
-                        dest_chat_id=dest_entity,      # cached entity
-                        topic_id=topic_id,
-                        progress_callback=None,
-                        custom_caption=custom_caption,
-                        source_messages=[msg],         # pass the msg directly!
-                        phase_state=phase_state,
-                    ),
-                    timeout=600,
-                )
-                if success:
-                    result["sent_count"] += 1
-                    return True
-                result["failed_count"] += 1
-                return False
-            except FloodWaitError as e:
-                result["flood_waits"] += 1
-                wait_seconds = e.seconds + 5
-                # Visible wait with a live countdown in the status line.
-                if not await _wait_visible(
-                    wait_seconds, cancel_event, phase_state, "flood",
-                    status_callback,
-                    announce=(
-                        f"⏳ Flood wait on send: sleeping {wait_seconds}s before "
-                        f"retrying... Sent so far: {result['sent_count']} — a live "
-                        f"countdown is shown in the status line."
-                    ),
-                ):
-                    result["failed_count"] += 1
-                    return False
-                # Retry once
-                try:
-                    success, _ = await _asyncio.wait_for(
-                        self.send_to_destination(
-                            source_chat_id=source_entity,
-                            source_message_ids=[msg.id],
-                            dest_chat_id=dest_entity,
-                            topic_id=topic_id,
-                            progress_callback=None,
-                            custom_caption=custom_caption,
-                            source_messages=[msg],
-                            phase_state=phase_state,
-                        ),
-                        timeout=600,
-                    )
+                flood_retries = 0
+                while True:
+                    try:
+                        # Timeout: generous (45 min) because send_to_destination
+                        # itself sleeps off capped flood waits internally — a
+                        # short timeout would kill a send MID-RECOVERY.
+                        success, _ = await _asyncio.wait_for(
+                            self.send_to_destination(
+                                source_chat_id=source_entity,  # cached entity
+                                source_message_ids=[msg.id],
+                                dest_chat_id=dest_entity,      # cached entity
+                                topic_id=topic_id,
+                                progress_callback=None,
+                                custom_caption=custom_caption,
+                                source_messages=[msg],         # pass the msg directly!
+                                phase_state=phase_state,
+                            ),
+                            timeout=2700,
+                        )
+                    except FloodWaitError as e:
+                        # Capped, visible wait (live countdown; 10-min cap)
+                        # then retry the SAME send.
+                        result["flood_waits"] += 1
+                        flood_retries += 1
+                        if flood_retries > 4:
+                            logger.warning(
+                                "scrape: msg %d still flooded after 4 capped "
+                                "waits — counting it failed, moving on", msg.id)
+                            result["failed_count"] += 1
+                            return False
+                        ready, _capped = await self._flood_sleep(
+                            float(e.seconds), cancel_event, phase_state,
+                            status_callback, where="send",
+                        )
+                        if not ready:  # cancelled mid-wait
+                            result["failed_count"] += 1
+                            return False
+                        continue  # retry the send
                     if success:
                         result["sent_count"] += 1
                         return True
-                except Exception:
-                    pass
-                result["failed_count"] += 1
-                return False
+                    result["failed_count"] += 1
+                    return False
             except _asyncio.TimeoutError:
-                logger.warning("scrape: send timed out for msg %d (10min limit)", msg.id)
+                logger.warning("scrape: send timed out for msg %d (45min limit)", msg.id)
                 result["failed_count"] += 1
                 return False
             except Exception as e:
@@ -2098,9 +2182,22 @@ class UserSession:
                 result["failed_count"] = -1
                 return result
 
-            # Fetch one batch of messages with FloodWait retry
+            # Fetch one batch of messages with FloodWait retry.
+            #
+            # Flood-wait budgets (two separate counters):
+            #   flood_tries   — SHORT server waits (below the 10-min cap);
+            #                   bounded by MAX_FLOOD_RETRIES as before.
+            #   capped_tries  — LONG server waits truncated at the cap; each
+            #                   retry re-asks the server, which answers with
+            #                   the (shrinking) remaining time, so a 30-min
+            #                   flood = 3 capped cycles. Bounded generously
+            #                   by _MAX_CAPPED_CYCLES (5h) — early retries
+            #                   must never kill an otherwise healthy run.
             batch_msgs = None
-            for attempt in range(MAX_FLOOD_RETRIES):
+            flood_tries = 0
+            capped_tries = 0
+            fetch_give_up = False
+            for attempt in range(10_000):
                 if cancel_event and cancel_event.is_set():
                     break
                 try:
@@ -2119,23 +2216,36 @@ class UserSession:
                     break
                 except FloodWaitError as e:
                     result["flood_waits"] += 1
-                    wait_seconds = e.seconds + 2
                     new_pace = read_pacer.on_flood(e.seconds)
-                    # Visible wait — the status message / dashboard shows a
-                    # LIVE countdown ("[FLOOD WAIT] 1187s remaining") while
-                    # we sleep, and /stop_scrape stays responsive.
-                    await _wait_visible(
-                        wait_seconds, cancel_event, phase_state, "flood",
-                        status_callback,
-                        announce=(
-                            f"⏳ Flood wait on get_messages: sleeping {wait_seconds}s "
-                            f"(attempt {attempt+1}/{MAX_FLOOD_RETRIES})...\n"
-                            f"   Sent so far: {result['sent_count']}, Seen: {result['total_seen']}\n"
-                            f"   Read pace auto-adjusted to {new_pace:.1f}s/batch\n"
-                            f"   A live countdown is shown in the status line."
-                        ),
+                    # Capped, visible wait — the status message / dashboard
+                    # shows a LIVE countdown ("[FLOOD WAIT] 9m32s remaining")
+                    # while we sleep; long server waits (>10 min) are
+                    # truncated and the batch is retried EARLY.
+                    ready, capped = await self._flood_sleep(
+                        float(e.seconds), cancel_event, phase_state,
+                        status_callback, where="get_messages",
                     )
-                    if cancel_event and cancel_event.is_set():
+                    if capped:
+                        capped_tries += 1
+                        if capped_tries > _MAX_CAPPED_CYCLES:
+                            logger.error(
+                                "scrape_channel: get_messages still flooded "
+                                "after %d capped cycles — giving up",
+                                capped_tries - 1)
+                            if status_callback:
+                                await status_callback(
+                                    f"❌ Still flooded after {capped_tries - 1} capped "
+                                    f"waits ({_MAX_CAPPED_CYCLES * int(self.flood_wait_cap or 0) // 60}+ min). "
+                                    f"Stopping scrape — resume later with /scrape <url> resume."
+                                )
+                            fetch_give_up = True
+                            break
+                    else:
+                        flood_tries += 1
+                        if flood_tries >= MAX_FLOOD_RETRIES:
+                            fetch_give_up = True
+                            break
+                    if not ready:  # cancelled mid-wait
                         break
                     # Retry the same batch (offset_id unchanged)
                     continue
@@ -2182,11 +2292,14 @@ class UserSession:
                         result["cancelled"] = True
                         break
                     continue  # retry the same batch
-            else:
-                # Exhausted all flood retries
+            if fetch_give_up:
+                # Exhausted flood budgets (short-wait retries or capped
+                # cycles) — stop cleanly; the checkpoint lets /resume continue.
                 if status_callback:
                     await status_callback(
-                        f"❌ Exhausted {MAX_FLOOD_RETRIES} flood retries. Stopping scrape.\n"
+                        f"❌ Exhausted flood retries on get_messages "
+                        f"({flood_tries} short + {capped_tries} capped). "
+                        f"Stopping scrape.\n"
                         f"   Sent: {result['sent_count']}, Seen: {result['total_seen']}"
                     )
                 result["failed_count"] = -1
@@ -2536,16 +2649,25 @@ class UserSession:
 
             Handles deleted-ID ranges by bisecting: a MessageIdInvalidError
             on a multi-ID slice means SOME ids in it are deleted, so we split
-            and recurse into both halves. FloodWaits sleep (cancel-aware)
-            and retry the SAME slice — the old code slept but then dropped
-            the half entirely, silently losing messages. Transient non-flood
-            errors get exponential backoff (1s, 2s, 4s) before the slice is
-            counted as failed. Sets result['failed_count'] = -1 to signal a
-            fatal abort.
+            and recurse into both halves. FloodWaits sleep (cancel-aware,
+            CAPPED at self.flood_wait_cap — long server waits are truncated
+            and retried early) and retry the SAME slice — the old code slept
+            but then dropped the half entirely, silently losing messages.
+            Transient non-flood errors get exponential backoff (1s, 2s, 4s)
+            before the slice is counted as failed. Sets
+            result['failed_count'] = -1 to signal a fatal abort.
+
+            Flood-wait budgets: short waits (under the cap) count against
+            MAX_FLOOD_RETRIES as before; CAPPED cycles (long server waits
+            retried early) count separately up to _MAX_CAPPED_CYCLES, so a
+            30-minute server flood = 3 ten-minute cycles never kills the
+            slice.
             """
             err_backoff = 0
             conn_backoff = 0
-            for attempt in range(MAX_FLOOD_RETRIES + 3):
+            flood_tries = 0
+            capped_tries = 0
+            for attempt in range(10_000):
                 if cancel_event and cancel_event.is_set():
                     result["cancelled"] = True
                     return
@@ -2577,22 +2699,26 @@ class UserSession:
                     return
                 except FloodWaitError as e:
                     result["flood_waits"] += 1
-                    wait = e.seconds + 2
-                    new_pace = send_pacer.on_flood(e.seconds)
-                    # Visible wait: live countdown in the status line while
-                    # we sleep off the server-requested wait.
-                    await _wait_visible(
-                        wait, cancel_event, phase_state, "flood",
-                        status_callback,
-                        announce=(
-                            f"⏳ FloodWait: sleeping {wait}s "
-                            f"(attempt {attempt+1}/{MAX_FLOOD_RETRIES})...\n"
-                            f"   Sent so far: {result['sent_count']}\n"
-                            f"   Batch delay auto-adjusted to {new_pace:.1f}s\n"
-                            f"   A live countdown is shown in the status line."
-                        ),
+                    send_pacer.on_flood(e.seconds)
+                    # Capped, visible wait: live countdown in the status
+                    # line; long server waits truncated at the 10-minute
+                    # cap and the slice retried EARLY.
+                    ready, capped = await self._flood_sleep(
+                        float(e.seconds), cancel_event, phase_state,
+                        status_callback, where="forward batch",
                     )
-                    if cancel_event and cancel_event.is_set():
+                    if capped:
+                        capped_tries += 1
+                        if capped_tries > _MAX_CAPPED_CYCLES:
+                            logger.error(
+                                "forward batch still flooded after %d "
+                                "capped cycles — giving up", capped_tries - 1)
+                            break  # -> fatal abort below
+                    else:
+                        flood_tries += 1
+                        if flood_tries >= MAX_FLOOD_RETRIES:
+                            break  # -> fatal abort below
+                    if not ready:  # cancelled mid-wait
                         result["cancelled"] = True
                         return
                     continue  # retry the same slice
@@ -2635,11 +2761,12 @@ class UserSession:
                         result["cancelled"] = True
                         return
                     continue
-            # Exhausted all retries for this slice — fatal abort
+            # Exhausted all flood budgets for this slice — fatal abort
             if status_callback:
                 await status_callback(
-                    f"❌ Exhausted all {MAX_FLOOD_RETRIES + 3} retries on IDs "
-                    f"{ids[0] if ids else '?'}+ — stopping."
+                    f"❌ Exhausted flood retries on IDs "
+                    f"{ids[0] if ids else '?'}+ ({flood_tries} short + "
+                    f"{capped_tries} capped) — stopping."
                 )
             result["failed_count"] = -1
 

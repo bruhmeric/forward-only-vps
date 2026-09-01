@@ -27,7 +27,7 @@ from telegram.ext import (
     Application, MessageHandler, CallbackQueryHandler, ContextTypes, filters,
 )
 
-from config import Config
+from config import Config, CODE_VERSION
 from db import Database
 from user_session import UserSession
 from topics import TopicManager
@@ -87,6 +87,7 @@ async def post_init(app: Application) -> None:
             cfg.session_name, cfg.api_id, cfg.api_hash,
             session_string=cfg.session_string,
             flood_sleep_threshold=cfg.flood_sleep_threshold,
+            flood_wait_cap=getattr(cfg, "flood_wait_cap", 600),
         )
         ok = await user_session.start()
         if ok:
@@ -222,6 +223,11 @@ async def _run_polling_with_stats(app: Application, cfg: Config) -> None:
             "bot_name": app.bot.username,
             "bot_id": app.bot.id,
             "mode": cfg.mode,
+            # Code build of the running bot (config.CODE_VERSION). The
+            # dashboard compares this to its expected build — a mismatch
+            # shows a "rebuild your containers" banner (the most common
+            # "dashboard doesn't update" cause is a stale image).
+            "build": CODE_VERSION,
             "telethon": telethon_status,
             "destination_group": cfg.destination_group_id,
             "destination_chat_title": bot_data.get("destination_chat_title"),
