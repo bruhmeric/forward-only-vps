@@ -23,7 +23,7 @@ from typing import Optional
 # the most common "dashboard doesn't update" report turned out to be a
 # stale docker image (docker-compose up -d WITHOUT --build) still running
 # the old code.
-CODE_VERSION = "v5"
+CODE_VERSION = "v6"
 
 try:
     from dotenv import load_dotenv

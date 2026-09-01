@@ -503,15 +503,23 @@ telegram-forwarder-vps/
 
 ### "Dashboard doesn't update"
 
-First check the **build pill** next to the status dot (top of the page) — it shows the code build the *bot container* is running.
+The page now **self-diagnoses** — walk it top to bottom:
 
-- **No pill / a yellow banner mentioning a rebuild** → the bot container is running an OLD image. `docker-compose up -d` does **not** rebuild changed code — always deploy with:
-  ```bash
-  docker-compose up -d --build
-  ```
-  A stale image predates the live countdowns, concurrent job cards and the 10-minute flood-wait cap, so an old bot genuinely looks frozen during long flood waits even though the dashboard code is new.
-- **Pill matches but data frozen** → check `docker-compose logs dashboard` and `docker-compose logs forwarder-bot`; the page keeps showing the last good data with an amber "Bot slow" pill for up to 15s during transient fetch failures — if it flips fully to "Bot Offline", the bot's /stats endpoint (port 8081) is not answering.
+1. **Build pill** (next to the status dot, top of the page): shows the code build the *bot container* is running.
+   - **No pill / a yellow banner mentioning a rebuild** → the bot container is running an OLD image. `docker-compose up -d` does **not** rebuild changed code — always deploy with:
+     ```bash
+     docker-compose up -d --build
+     ```
+     A stale image predates the live countdowns, concurrent job cards and the 10-minute flood-wait cap, so an old bot genuinely looks frozen during long flood waits even though the dashboard code is new.
+2. **Amber "Bot data frozen" pill** → the dashboard is receiving *online* replies whose embedded bot clock is NOT advancing: the response is cached somewhere (proxy / "cache everything" rule) or the bot process is stalled. Check `docker logs forwarder-bot`, and if the dashboard runs behind Cloudflare make sure no Cache Everything page rule covers it. All responses now send `Cache-Control: no-store` (plus a cache-busting query param per poll), so a proxy/browser cache can no longer masquerade as a frozen bot.
+3. **Footer "Bot data age"** → how old the bot's own `/stats` snapshot is. It should stay near 0–3 s. A growing age with an online pill means network/latency issues; an age that never changes matches the frozen pill above.
+
+If none of the above applies but the page *still* looks frozen: **hard-refresh the browser** (`Ctrl+Shift+R`) — the browser may be running an old cached copy of the page itself (the page is now served with `no-store`, so this only happens once for pre-existing tabs), and browsers throttle timers in background tabs — the page re-polls the moment you focus it again.
+
+- **"Bot slow" amber pill** → the page keeps showing the last good data for up to 15 s during transient fetch failures (a busy bot can take seconds to answer). If it flips fully to "Bot Offline", the bot's /stats endpoint (port 8081) is not answering — check `docker-compose logs forwarder-bot`.
 - **During a flood wait** — counters intentionally pause while the `[FLOOD WAIT]` countdown ticks down; with the 10-minute cap, a milestone "RETRYING early" message appears at most every 10 minutes. That is the bot working as designed, not a freeze.
+
+The page polls with a strictly serial, self-scheduling request chain (one request at a time, hard timeout, superseded responses dropped) — a slow bot can no longer cause overlapping out-of-order responses that made numbers freeze or jump backwards.
 
 ### `/scrape` hits FloodWait on big channels
 

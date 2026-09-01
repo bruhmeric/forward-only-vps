@@ -26,13 +26,18 @@ FORWARDER_RESET_STATS_URL = os.environ.get("FORWARDER_RESET_STATS_URL",
 
 DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8080"))
 
+# Every response we serve is live telemetry: nothing may be cached by
+# the browser, a proxy (Cloudflare) or the back/forward cache — a cached
+# /api/stats reply is indistinguishable from a frozen dashboard.
+NO_STORE = {"Cache-Control": "no-store, must-revalidate"}
+
 # Build of the forwarder-bot code this dashboard expects (kept in sync
 # with telegram_forwarder-bot/config.py CODE_VERSION — bump both
 # together). The bot reports its own `build` in /stats; a mismatch means
 # one container is running stale code (classic cause of "dashboard
 # doesn't update": docker-compose up -d was run WITHOUT --build) and the
 # dashboard shows a rebuild banner.
-EXPECTED_BOT_BUILD = "v5"
+EXPECTED_BOT_BUILD = "v6"
 
 # Shared outbound HTTP session (reused across polls instead of a new
 # connection every 3s) and a generous timeout: a busy bot can take a
@@ -76,7 +81,7 @@ async def api_stats(request: web.Request) -> web.Response:
     return web.json_response({
         "forwarder": forwarder_stats,
         "forwarder_online": forwarder_stats is not None,
-    })
+    }, headers=NO_STORE)
 
 
 async def api_stop_scrape(request: web.Request) -> web.Response:
@@ -88,24 +93,27 @@ async def api_stop_scrape(request: web.Request) -> web.Response:
     if job:
         url += f"?job={quote(job)}"
     result = await post_json(url)
-    return web.json_response(result or {"ok": False, "error": "Failed to reach forwarder bot"})
+    return web.json_response(result or {"ok": False, "error": "Failed to reach forwarder bot"},
+                             headers=NO_STORE)
 
 
 async def api_cancel_caption(request: web.Request) -> web.Response:
     """POST /api/cancel_caption — clear the custom caption."""
     result = await post_json(FORWARDER_CANCEL_CAPTION_URL)
-    return web.json_response(result or {"ok": False, "error": "Failed to reach forwarder bot"})
+    return web.json_response(result or {"ok": False, "error": "Failed to reach forwarder bot"},
+                             headers=NO_STORE)
 
 
 async def api_reset_stats(request: web.Request) -> web.Response:
     """POST /api/reset_stats — reset all cumulative stats to 0."""
     result = await post_json(FORWARDER_RESET_STATS_URL)
-    return web.json_response(result or {"ok": False, "error": "Failed to reach forwarder bot"})
+    return web.json_response(result or {"ok": False, "error": "Failed to reach forwarder bot"},
+                             headers=NO_STORE)
 
 
 async def api_health(request: web.Request) -> web.Response:
     """GET /api/health — simple health check."""
-    return web.json_response({"ok": True, "service": "dashboard"})
+    return web.json_response({"ok": True, "service": "dashboard"}, headers=NO_STORE)
 
 
 # ----- HTML dashboard -----
@@ -230,6 +238,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         #version-banner code { background: #1a1f2e; padding: 2px 7px; border-radius: 5px;
                               font-size: 12.5px; color: #fde68a; }
         .status-dot.status-stale { background: #f59e0b; box-shadow: 0 0 8px #f59e0b; }
+        .status-pill.warn { border-color: #f59e0b; }
+        .status-pill.warn #freshness-text { color: #f59e0b; font-weight: 600; }
     </style>
 </head>
 <body>
@@ -249,6 +259,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
         <div class="status-pill" id="build-pill" style="display:none">
             <span id="build-pill-text">build ?</span>
+        </div>
+        <div class="status-pill warn" id="freshness-pill" style="display:none">
+            <span id="freshness-text">?</span>
         </div>
     </div>
 
@@ -324,10 +337,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     <div class="footer">
         Auto-refreshing every 3 seconds · Last update: <span id="last-update">--</span>
+        · Bot data age: <span id="bot-data-age">--</span>
     </div>
 
     <script>
-        const EXPECTED_BOT_BUILD = 'v5';
+        const EXPECTED_BOT_BUILD = 'v6';
         // Last good /stats payload + when it arrived. On transient fetch
         // failures we keep rendering it (with a "reconnecting" pill) for
         // up to 15s instead of instantly blanking everything to "Bot
@@ -335,6 +349,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         // offline on one slow poll LOOKS like "dashboard doesn't update".
         let lastGood = null, lastGoodAt = 0;
         const STALE_GRACE_MS = 15000;
+
+        // ---- poll scheduling ----
+        // STRICTLY SERIAL, self-scheduling chain — NEVER setInterval.
+        // setInterval + async fetch overlaps in-flight requests when the
+        // bot is slow (exactly during scrapes): an older response can
+        // resolve AFTER a newer one and re-render stale numbers, making
+        // the dashboard look frozen or jump backwards. `let` (not const)
+        // so the Node test-harness can shorten both.
+        let POLL_MS = 3000;
+        let FETCH_TIMEOUT_MS = 9000;
+        let pollBusy = false;      // overlap guard
+        let pollSeq = 0;           // superseded-response guard
+        let pollTimer = null;
 
         // Run one update section; a failure in one section must never
         // block the others (a JS error in updateScrape used to abort the
@@ -344,9 +371,43 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
 
         async function fetchStats() {
+            if (pollBusy) return;              // one poll at a time
+            pollBusy = true;
+            const mySeq = ++pollSeq;
+            let killTimer = null;
             try {
-                const resp = await fetch('/api/stats');
-                const data = await resp.json();
+                // Cache-buster + no-store: proxies (Cloudflare "cache
+                // everything" rules) and the browser must never serve a
+                // cached /api/stats reply — that looks EXACTLY like a
+                // frozen dashboard.
+                const url = '/api/stats?_=' + Date.now();
+                const opts = { cache: 'no-store' };
+                const ctl = (typeof AbortController !== 'undefined')
+                    ? new AbortController() : null;
+                if (ctl) opts.signal = ctl.signal;
+                // One work promise covers fetch AND body-parse; raced
+                // against a hard timeout so a hung connection (laptop
+                // sleep/wake, network switch, proxy idle timeout) can
+                // never wedge the poll loop forever.
+                const work = (async () => {
+                    const resp = await fetch(url, opts);
+                    return await resp.json();
+                })();
+                const timeoutP = new Promise((_, reject) => {
+                    killTimer = setTimeout(
+                        () => reject(new Error('poll timeout')),
+                        FETCH_TIMEOUT_MS);
+                });
+                let data;
+                try {
+                    data = await Promise.race([work, timeoutP]);
+                } catch (e) {
+                    if (ctl) ctl.abort();   // cancel the hung request
+                    throw e;
+                } finally {
+                    if (killTimer) clearTimeout(killTimer);
+                }
+                if (mySeq !== pollSeq) return;          // superseded — drop
                 if (data.forwarder_online) {
                     lastGood = data;
                     lastGoodAt = Date.now();
@@ -357,13 +418,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     render(data, false);
                 }
             } catch (e) {
-                // /api/stats itself unreachable — reuse recent good data
-                if (lastGood && Date.now() - lastGoodAt < STALE_GRACE_MS) {
-                    render(lastGood, true);
-                } else {
-                    render({ forwarder_online: false, forwarder: null }, false);
+                if (mySeq === pollSeq) {
+                    // /api/stats itself unreachable or timed out — reuse
+                    // recent good data
+                    if (lastGood && Date.now() - lastGoodAt < STALE_GRACE_MS) {
+                        render(lastGood, true);
+                    } else {
+                        render({ forwarder_online: false, forwarder: null }, false);
+                    }
+                    console.error('Fetch failed:', e);
                 }
-                console.error('Fetch failed:', e);
+            } finally {
+                pollBusy = false;
             }
         }
 
@@ -372,9 +438,47 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             safe(updateBot, data, stale);
             safe(updateCumulative, data);
             safe(updateScrape, data);
+            safe(updateFreshness, data, stale);
             if (!stale) {
                 document.getElementById('last-update').textContent =
                     new Date().toLocaleTimeString();
+            }
+        }
+
+        // ---- data-freshness watchdog ----
+        // /stats embeds the BOT's own clock (`timestamp`, unix seconds).
+        // A healthy pipeline advances it on EVERY poll even while
+        // counters sit still (long flood waits / breaks — the countdown
+        // is recomputed server-side per request). If it does NOT advance
+        // across 2+ online polls, the reply is cached or the bot process
+        // is stalled — an amber pill then makes "waiting" vs "dead"
+        // obvious at a glance instead of looking like a frozen dashboard.
+        let lastBotTs = 0, frozenPolls = 0;
+
+        function updateFreshness(data, stale) {
+            const pill = document.getElementById('freshness-pill');
+            const text = document.getElementById('freshness-text');
+            if (stale) return;              // amber "Bot slow" pill covers it
+            const f = data.forwarder || {};
+            const botTs = Number(f.timestamp) || 0;
+            if (botTs) {
+                if (botTs <= lastBotTs + 0.001) frozenPolls += 1;
+                else frozenPolls = 0;
+                lastBotTs = botTs;
+                const age = Math.max(0, Math.floor(Date.now() / 1000 - botTs));
+                document.getElementById('bot-data-age').textContent = age + 's';
+            }
+            if (!data.forwarder_online) {
+                pill.style.display = 'none';
+                frozenPolls = 0;
+                return;
+            }
+            if (frozenPolls >= 2) {
+                pill.style.display = '';
+                text.textContent = 'Bot data frozen ' + frozenPolls +
+                    ' polls — cached reply or stalled bot. Check: docker logs forwarder-bot';
+            } else {
+                pill.style.display = 'none';
             }
         }
 
@@ -641,17 +745,50 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             } catch (e) { console.error(e); }
         }
 
-        // Auto-refresh every 3 seconds
-        fetchStats();
-        setInterval(fetchStats, 3000);
+        // ---- poll loop: strictly serial, self-scheduling ----
+        // pollCycle always re-arms itself AFTER the current poll settles,
+        // so requests can never overlap and responses can never arrive
+        // out of order (the classic "frozen / backwards-jumping numbers"
+        // bug of setInterval + slow backend).
+        async function pollCycle() {
+            try {
+                await fetchStats();
+            } catch (e) {
+                console.error(e);
+            } finally {
+                pollTimer = setTimeout(pollCycle, POLL_MS);
+            }
+        }
+
+        // Force an immediate poll. Used when the tab becomes visible
+        // again (browsers throttle timers in hidden tabs to ~1/min —
+        // Chrome's "intensive throttling" can freeze a backgrounded
+        // dashboard for minutes) and when the network comes back after
+        // sleep / Wi-Fi switch.
+        function kickPoll() {
+            if (pollBusy) return;               // a poll is in flight
+            if (pollTimer) clearTimeout(pollTimer);
+            pollTimer = setTimeout(pollCycle, 0);
+        }
+        document.addEventListener('visibilitychange', function () {
+            if (!document.hidden) kickPoll();
+        });
+        if (typeof window !== 'undefined' && window.addEventListener) {
+            window.addEventListener('online', kickPoll);
+        }
+
+        pollCycle();
     </script>
 </body>
 </html>"""
 
 
 async def dashboard_handler(request: web.Request) -> web.Response:
-    """Serve the HTML dashboard."""
-    return web.Response(text=DASHBOARD_HTML, content_type="text/html")
+    """Serve the HTML dashboard. no-store: the browser must always run
+    the CURRENT page JS (an older cached copy can lack every fix below
+    and look like a dead dashboard; a hard refresh fixes that)."""
+    return web.Response(text=DASHBOARD_HTML, content_type="text/html",
+                        headers=NO_STORE)
 
 
 async def main():

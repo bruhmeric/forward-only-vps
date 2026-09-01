@@ -166,7 +166,9 @@ async def _run_polling_with_stats(app: Application, cfg: Config) -> None:
 
     async def health_handler(request: web.Request) -> web.Response:
         return web.Response(text="OK", status=200,
-                            headers={"Content-Type": "text/plain"})
+                            headers={"Content-Type": "text/plain",
+                                     # live telemetry — never cache anywhere
+                                     "Cache-Control": "no-store"})
 
     async def stats_handler(request: web.Request) -> web.Response:
         """Return JSON status of the forwarder bot for the dashboard."""
@@ -253,7 +255,7 @@ async def _run_polling_with_stats(app: Application, cfg: Config) -> None:
             },
             "timestamp": _time.time(),
         }
-        return web.json_response(stats)
+        return web.json_response(stats, headers={"Cache-Control": "no-store"})
 
     async def stop_scrape_handler(request: web.Request) -> web.Response:
         """POST /stop_scrape[?job=J1|all] — stop scrape job(s).
@@ -271,7 +273,8 @@ async def _run_polling_with_stats(app: Application, cfg: Config) -> None:
         jobs = _scrape_jobs(_CtxView(app.bot_data))
         active = [j for j in jobs.values() if _job_is_active(j)]
         if not active:
-            return web.json_response({"ok": False, "error": "No active scrape"})
+            return web.json_response({"ok": False, "error": "No active scrape"},
+                                     headers={"Cache-Control": "no-store"})
         a = arg.lower()
         if a in ("", "all", "*"):
             targets = active
@@ -280,7 +283,8 @@ async def _run_polling_with_stats(app: Application, cfg: Config) -> None:
             job = jobs.get(jid.upper())
             if job is None or not _job_is_active(job):
                 return web.json_response(
-                    {"ok": False, "error": f"No active job matching '{arg}'"})
+                    {"ok": False, "error": f"No active job matching '{arg}'"},
+                    headers={"Cache-Control": "no-store"})
             targets = [job]
         for j in targets:
             j["cancel_event"].set()
@@ -288,7 +292,7 @@ async def _run_polling_with_stats(app: Application, cfg: Config) -> None:
             "ok": True,
             "stopped": [j["job_id"] for j in targets],
             "message": f"Stop signal sent to {len(targets)} job(s)",
-        })
+        }, headers={"Cache-Control": "no-store"})
 
     async def cancel_caption_handler(request: web.Request) -> web.Response:
         """POST /cancel_caption — clears the custom caption."""
@@ -296,7 +300,8 @@ async def _run_polling_with_stats(app: Application, cfg: Config) -> None:
         if db:
             await db.set_runtime("custom_caption", "__none__")
         app.bot_data.pop("custom_caption", None)
-        return web.json_response({"ok": True, "message": "Caption cleared"})
+        return web.json_response({"ok": True, "message": "Caption cleared"},
+                                headers={"Cache-Control": "no-store"})
 
     async def reset_stats_handler(request: web.Request) -> web.Response:
         """POST /reset_stats — reset all cumulative stats to 0."""
@@ -304,10 +309,13 @@ async def _run_polling_with_stats(app: Application, cfg: Config) -> None:
         if db:
             try:
                 await db.reset_stats()
-                return web.json_response({"ok": True, "message": "Stats reset to 0"})
+                return web.json_response({"ok": True, "message": "Stats reset to 0"},
+                                        headers={"Cache-Control": "no-store"})
             except Exception as e:
-                return web.json_response({"ok": False, "error": str(e)})
-        return web.json_response({"ok": False, "error": "Database not available"})
+                return web.json_response({"ok": False, "error": str(e)},
+                                        headers={"Cache-Control": "no-store"})
+        return web.json_response({"ok": False, "error": "Database not available"},
+                                headers={"Cache-Control": "no-store"})
 
     # ----- build the web app -----
     web_app = web.Application()
