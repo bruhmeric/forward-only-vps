@@ -15,6 +15,7 @@ import asyncio
 import inspect
 import logging
 import os
+import random
 import re
 import time
 from dataclasses import dataclass
@@ -178,6 +179,62 @@ class AdaptivePacer:
             self._clean_streak = 0
 
 
+def _human_jitter(base: float, lo: float = 0.75, hi: float = 1.6) -> float:
+    """Randomise a delay so the traffic pattern isn't metronomic.
+
+    Fixed-interval request patterns (exactly 3.5s every batch) are trivially
+    fingerprinted by anti-spam heuristics; real humans are irregular. We
+    randomise every inter-batch delay to 75%-160% of the pacer's current
+    value — e.g. a 3.5s base sleeps somewhere in [2.6s, 5.6s].
+    """
+    if base <= 0:
+        return 0.0
+    return random.uniform(base * lo, base * hi)
+
+
+class BreakScheduler:
+    """Take an extended, cancel-aware break every N sent messages.
+
+    Telegram's account-level budgets recover slowly. Even at a flood-free
+    per-request pace, a 20k-message forward accumulates pressure over the
+    run. Pausing 5 minutes after every 500 sends (configurable via
+    FLOOD_BREAK_EVERY / FLOOD_BREAK_SECONDS) lets the account's budget
+    fully recover, exactly like a human taking a break.
+    """
+
+    def __init__(self, every: int = 500, seconds: float = 300.0):
+        self.every = max(0, int(every))
+        self.seconds = max(0.0, float(seconds))
+        self._last_break_at = 0
+        self.breaks_taken = 0
+
+    async def maybe_break(self, sent_count: int, cancel_event=None,
+                          status_callback=None, label: str = "forward") -> bool:
+        """Sleep if we've advanced `every` messages since the last break.
+
+        Returns True if a break was taken; False if cancelled mid-break
+        (callers should treat a cancelled break as a cancel of the run).
+        """
+        if self.every <= 0 or self.seconds <= 0:
+            return True
+        if sent_count - self._last_break_at < self.every:
+            return True
+        self._last_break_at = sent_count
+        self.breaks_taken += 1
+        if status_callback:
+            try:
+                await status_callback(
+                    f"☕ Extended break #{self.breaks_taken}: {self.seconds:.0f}s "
+                    f"after {sent_count} {label}ed messages (rate-budget recovery). "
+                    f"Send /stop_scrape to cancel."
+                )
+            except Exception:
+                pass
+        if not await _sleep_chunks(self.seconds, cancel_event, chunk=5.0):
+            return False
+        return True
+
+
 _FORWARD_SUPPORTS_DROP_MEDIA_CAPTIONS: Optional[bool] = None
 
 
@@ -210,14 +267,30 @@ def _forward_kwargs(drop_author: bool, drop_media_captions: bool) -> dict:
 
 class UserSession:
     def __init__(self, session_name: str, api_id: int, api_hash: str,
-                 session_string: Optional[str] = None) -> None:
+                 session_string: Optional[str] = None,
+                 flood_sleep_threshold: int = 86400) -> None:
         """Create a Telethon client backed by either a file-based session
         (session_name) or a StringSession (session_string). StringSession is
         preferred for ephemeral filesystems like Render's free tier.
 
         Enables Telethon's built-in auto_reconnect and connection_retries
         to handle transient network drops silently — combined with our
-        own _ensure_connected() for cases where auto_reconnect fails."""
+        own _ensure_connected() for cases where auto_reconnect fails.
+
+        flood_sleep_threshold (Telethon-first flood strategy):
+            Telethon BUILTS IN auto-sleep + auto-retry for FloodWait /
+            FloodPremiumWait / SlowModeWait errors whose requested wait is
+            <= this threshold (seconds). With the default 86400 (Telethon's
+            hard maximum — anything larger is clamped to one day) EVERY
+            flood wait is absorbed invisibly inside the request call, so
+            scrapes can no longer die from FloodWait at all.
+
+            ⚠️ DO NOT pass None. Unlike what some old snippets claim,
+            Telethon's setter converts None to 0 — which RAISES every
+            FloodWaitError instead of sleeping. 0 = full manual control,
+            86400 = "wait for anything". Our own except-FloodWait blocks
+            remain as a fallback for the (rare) >24h waits.
+        """
         client_kwargs = dict(
             api_id=api_id,
             api_hash=api_hash,
@@ -228,6 +301,9 @@ class UserSession:
             retry_delay=2,           # 2s between retries
             auto_reconnect=True,     # reconnect automatically on disconnect
             request_retries=3,       # retry failed requests 3 times
+            # Let Telethon itself sleep off + retry every flood wait up to
+            # one day (its maximum) instead of raising FloodWaitError.
+            flood_sleep_threshold=min(int(flood_sleep_threshold or 0), 24 * 60 * 60),
         )
         if session_string:
             from telethon.sessions import StringSession
@@ -1612,6 +1688,8 @@ class UserSession:
         media_types: list[str] | None = None,
         parallel: int = 3,
         custom_caption: str | None = None,
+        flood_break_every: int = 500,
+        flood_break_seconds: int = 300,
     ) -> dict:
         """Iterate all messages in a channel and forward each media message
         to the destination chat. Used by the /scrape command.
@@ -1632,6 +1710,9 @@ class UserSession:
             skipped (counted in skipped_count).
           parallel: number of concurrent sends. Default 3 (safe for Telegram).
             Higher values risk FloodWait. Each task uses its own asyncio task.
+          flood_break_every / flood_break_seconds: take an extended break
+            (default 300s every 500 sends) so the account-level rate budget
+            fully recovers on long scrapes. Set flood_break_every=0 to disable.
 
         Returns:
           dict with keys: sent_count, failed_count, skipped_count,
@@ -1885,11 +1966,25 @@ class UserSession:
         BATCH_DELAY = 3.5
         read_pacer = AdaptivePacer(base=BATCH_DELAY, maximum=15.0)
         MAX_FLOOD_RETRIES = 10
+        # Transient non-flood errors (timeouts, RPC hiccups, resets) get
+        # exponential backoff instead of instantly killing the scrape:
+        # 1s → 2s → 4s → give up. counter resets on every clean batch.
+        MAX_ERR_RETRIES = 3
+        err_backoff = 0
+        break_sched = BreakScheduler(flood_break_every, flood_break_seconds)
 
-        # For reverse=True (oldest first), we need a different approach:
-        # use min_id to paginate forward through history.
-        # For reverse=False (newest first, default), use offset_id to paginate backward.
-        current_offset_id = min_id if min_id > 0 else 0
+        # ── Resume / range bounds ─────────────────────────────────────────
+        # For reverse=True (oldest first): walk forward from min_id
+        #   (get_messages(reverse=True, min_id=X) → messages with id > X,
+        #    oldest first). Stop once ids pass max_id.
+        # For reverse=False (newest first): walk backward from max_id
+        #   (offset_id=Y → messages with id < Y, newest first). Stop once
+        #   ids reach min_id.
+        # NOTE: the old code set `current_offset_id = min_id`, which fetched
+        # messages BELOW min_id — the exact opposite of the documented
+        # "skip messages with id <= min_id" — and ignored max_id entirely.
+        # This made resume-by-checkpoint impossible; fixed here.
+        current_offset_id = (max_id + 1) if (not reverse and max_id > 0) else 0
         current_min_id_for_reverse = min_id if min_id > 0 else 0
 
         scrape_done = False
@@ -1957,11 +2052,34 @@ class UserSession:
                     result["cancelled"] = True
                     break
                 except Exception as e:
-                    logger.exception("scrape_channel: get_messages failed")
+                    # Transient errors (timeouts, RPC hiccups, resets) get
+                    # exponential backoff — 1s, 2s, 4s — before giving up.
+                    # The old code aborted the ENTIRE scrape on the first
+                    # non-flood error, throwing away thousands of messages
+                    # of progress.
+                    err_backoff += 1
+                    if err_backoff > MAX_ERR_RETRIES:
+                        logger.exception("scrape_channel: get_messages failed "
+                                         "after %d retries", MAX_ERR_RETRIES)
+                        if status_callback:
+                            await status_callback(f"❌ Fetch error: {type(e).__name__}: {e}")
+                        result["failed_count"] = -1
+                        return result
+                    delay = 2 ** (err_backoff - 1)  # 1, 2, 4
+                    logger.warning("scrape_channel: get_messages error %s: %s — "
+                                   "retry %d/%d in %ds",
+                                   type(e).__name__, e, err_backoff,
+                                   MAX_ERR_RETRIES, delay)
                     if status_callback:
-                        await status_callback(f"❌ Fetch error: {type(e).__name__}: {e}")
-                    result["failed_count"] = -1
-                    return result
+                        await status_callback(
+                            f"⚠️ Fetch error {type(e).__name__} — "
+                            f"retry {err_backoff}/{MAX_ERR_RETRIES} in {delay}s"
+                        )
+                    await _sleep_chunks(delay, cancel_event)
+                    if cancel_event and cancel_event.is_set():
+                        result["cancelled"] = True
+                        break
+                    continue  # retry the same batch
             else:
                 # Exhausted all flood retries
                 if status_callback:
@@ -1981,6 +2099,34 @@ class UserSession:
             if not batch_msgs:
                 scrape_done = True
                 break
+
+            # Clean fetch — reset the transient-error backoff ladder
+            err_backoff = 0
+
+            # ── Enforce resume / range bounds on this batch ────────────────
+            # newest-first: batch is newest→oldest; drop ids <= min_id and
+            #   stop if the whole batch is below the bound.
+            # oldest-first: batch is oldest→newest; drop ids > max_id and
+            #   stop once we've crossed it.
+            if not reverse and min_id > 0:
+                bounded = [m for m in batch_msgs if m is not None and m.id > min_id]
+                if not bounded:
+                    scrape_done = True
+                    break
+                batch_msgs = bounded
+                batch_final = False
+            elif reverse and max_id > 0:
+                bounded = [m for m in batch_msgs if m is not None and m.id <= max_id]
+                if not bounded:
+                    scrape_done = True
+                    break
+                # If the batch reaches the upper bound, this is the last one
+                if max(m.id for m in bounded) >= max_id:
+                    batch_final = True
+                else:
+                    batch_final = False
+            else:
+                batch_final = False
 
             # Process each message in the batch
             for msg in batch_msgs:
@@ -2089,7 +2235,7 @@ class UserSession:
                     pass
 
             # If we got fewer than BATCH_SIZE messages, we've reached the end
-            if len(batch_msgs) < BATCH_SIZE:
+            if len(batch_msgs) < BATCH_SIZE or batch_final:
                 scrape_done = True
                 break
 
@@ -2098,13 +2244,23 @@ class UserSession:
                 result["cancelled"] = True
                 break
 
+            # ── Extended break (human-like pacing) ─────────────────────────
+            # Every flood_break_every sends, pause flood_break_seconds so
+            # the account-level budget fully recovers. Cancel-aware.
+            if not await break_sched.maybe_break(
+                result["sent_count"], cancel_event, status_callback, "sent"
+            ):
+                result["cancelled"] = True
+                break
+
             # Sleep between batches to respect Telegram's rate limit.
             # The batch fetched cleanly — count it towards pace recovery,
-            # then sleep the (adaptive) inter-batch delay. _sleep_chunks is
-            # float-safe and cancel-aware; the old `range(BATCH_DELAY)` loop
-            # only supported whole seconds and ignored pacing changes.
+            # then sleep the (adaptive, human-jittered) inter-batch delay:
+            # fixed metronomic intervals are easy for anti-spam heuristics
+            # to fingerprint, so every sleep is randomized to 75–160% of
+            # the pacer value. _sleep_chunks is float-safe and cancel-aware.
             read_pacer.on_success()
-            if not await _sleep_chunks(read_pacer.current, cancel_event):
+            if not await _sleep_chunks(_human_jitter(read_pacer.current), cancel_event):
                 result["cancelled"] = True
                 break
 
@@ -2150,6 +2306,8 @@ class UserSession:
         drop_media_captions: bool = False,
         batch_size: int = 100,
         batch_delay: float = 3.5,
+        flood_break_every: int = 500,
+        flood_break_seconds: int = 300,
     ) -> dict:
         """Forward messages from a public channel by ID range — NO getHistory.
 
@@ -2175,7 +2333,11 @@ class UserSession:
           batch_delay: base seconds between batches. 3.5 s ≈ 28.5 msgs/s,
             safely under Telegram's ~30 msgs/s sustained account budget
             (the old 1.5 s ≈ 66 msgs/s is what triggered FloodWait around
-            ~2000 messages on big channels). Grows automatically on FloodWait.
+            ~2000 messages on big channels). Grows automatically on FloodWait
+            and is randomized (human jitter) on every batch.
+          flood_break_every / flood_break_seconds: extended break every N
+            sends (default 300s every 500) so the account-level budget fully
+            recovers on huge ranges. Set flood_break_every=0 to disable.
 
         Returns:
           dict with sent_count, failed_count, total_seen, last_message_id, etc.
@@ -2259,6 +2421,7 @@ class UserSession:
         # backs off further whenever Telegram complains and slowly recovers
         # afterwards, converging on the fastest flood-free pace.
         send_pacer = AdaptivePacer(base=batch_delay, maximum=20.0)
+        break_sched = BreakScheduler(flood_break_every, flood_break_seconds)
 
         # Build forward kwargs once — drop_media_captions needs Telethon
         # >= 1.40 (detect support instead of crashing with TypeError).
@@ -2271,10 +2434,14 @@ class UserSession:
             on a multi-ID slice means SOME ids in it are deleted, so we split
             and recurse into both halves. FloodWaits sleep (cancel-aware)
             and retry the SAME slice — the old code slept but then dropped
-            the half entirely, silently losing messages. Sets
-            result['failed_count'] = -1 to signal a fatal abort.
+            the half entirely, silently losing messages. Transient non-flood
+            errors get exponential backoff (1s, 2s, 4s) before the slice is
+            counted as failed. Sets result['failed_count'] = -1 to signal a
+            fatal abort.
             """
-            for attempt in range(MAX_FLOOD_RETRIES):
+            err_backoff = 0
+            conn_backoff = 0
+            for attempt in range(MAX_FLOOD_RETRIES + 3):
                 if cancel_event and cancel_event.is_set():
                     result["cancelled"] = True
                     return
@@ -2296,8 +2463,10 @@ class UserSession:
                     await _forward_ids(ids[:mid])
                     if result["cancelled"] or result["failed_count"] == -1:
                         return
-                    # Pace between the bisection halves as well
-                    if not await _sleep_chunks(send_pacer.current / 2, cancel_event):
+                    # Pace (human-jittered) between the bisection halves too
+                    if not await _sleep_chunks(
+                        _human_jitter(send_pacer.current / 2), cancel_event
+                    ):
                         result["cancelled"] = True
                         return
                     await _forward_ids(ids[mid:])
@@ -2314,12 +2483,21 @@ class UserSession:
                             f"   Batch delay auto-adjusted to {new_pace:.1f}s"
                         )
                     await _sleep_chunks(wait, cancel_event)
+                    if cancel_event and cancel_event.is_set():
+                        result["cancelled"] = True
+                        return
                     continue  # retry the same slice
-                except ConnectionError:
-                    logger.warning("connection dropped during forward — reconnecting")
+                except ConnectionError as e:
+                    conn_backoff += 1
+                    # Exponential reconnect backoff: 2s, 4s, 8s
+                    delay = 2 ** min(3, conn_backoff)
+                    logger.warning("connection dropped during forward (%s) — "
+                                   "reconnecting in %ds", e, delay)
                     if status_callback:
-                        await status_callback("⚠️ Connection dropped. Reconnecting...")
-                    await _asyncio.sleep(2)
+                        await status_callback(f"⚠️ Connection dropped. Reconnecting in {delay}s...")
+                    if not await _sleep_chunks(delay, cancel_event):
+                        result["cancelled"] = True
+                        return
                     if not await self._ensure_connected():
                         result["failed_count"] = -1
                         return
@@ -2328,13 +2506,30 @@ class UserSession:
                     result["cancelled"] = True
                     return
                 except Exception as e:
-                    logger.warning("forward batch failed: %s", e)
-                    result["failed_count"] += len(ids)
-                    return
-            # Exhausted flood retries for this slice — fatal abort
+                    # Transient errors (timeouts, RPC hiccups): exponential
+                    # backoff 1s → 2s → 4s before counting the slice failed.
+                    # The old code instantly failed the batch and moved on.
+                    err_backoff += 1
+                    if err_backoff > 3:
+                        logger.warning("forward batch failed after retries: %s", e)
+                        result["failed_count"] += len(ids)
+                        return
+                    delay = 2 ** (err_backoff - 1)
+                    logger.warning("forward batch error %s: %s — retry %d/3 in %ds",
+                                   type(e).__name__, e, err_backoff, delay)
+                    if status_callback:
+                        await status_callback(
+                            f"⚠️ Forward error {type(e).__name__} — "
+                            f"retry {err_backoff}/3 in {delay}s"
+                        )
+                    if not await _sleep_chunks(delay, cancel_event):
+                        result["cancelled"] = True
+                        return
+                    continue
+            # Exhausted all retries for this slice — fatal abort
             if status_callback:
                 await status_callback(
-                    f"❌ Exhausted {MAX_FLOOD_RETRIES} flood retries on IDs "
+                    f"❌ Exhausted all {MAX_FLOOD_RETRIES + 3} retries on IDs "
                     f"{ids[0] if ids else '?'}+ — stopping."
                 )
             result["failed_count"] = -1
@@ -2396,13 +2591,27 @@ class UserSession:
 
             current_id = batch_end + 1
 
-            # Adaptive inter-batch delay. NOTE: the old code used
-            # `range(int(batch_delay))`, which silently TRUNCATED fractional
-            # delays (the documented 1.5 s actually slept only 1 s — even
-            # faster than intended). _sleep_chunks is float-safe, honours the
-            # pacer, and stays cancellable.
             if current_id <= end_id:
-                if not await _sleep_chunks(send_pacer.current, cancel_event):
+                # ── Extended break (human-like pacing) ─────────────────────
+                # Every flood_break_every sends, pause flood_break_seconds
+                # (default 5 min per 500) so the account-level budget fully
+                # recovers — long ranges accumulate pressure even at a
+                # flood-free per-batch pace. Cancel-aware via _sleep_chunks.
+                if not await break_sched.maybe_break(
+                    result["sent_count"], cancel_event, status_callback, "forward"
+                ):
+                    result["cancelled"] = True
+                    break
+
+                # Adaptive inter-batch delay with human jitter. NOTE: the
+                # old code used `range(int(batch_delay))`, which silently
+                # TRUNCATED fractional delays (the documented 1.5 s actually
+                # slept only 1 s — even faster than intended). _sleep_chunks
+                # is float-safe, honours the pacer, randomizes the delay so
+                # the pattern isn't metronomic, and stays cancellable.
+                if not await _sleep_chunks(
+                    _human_jitter(send_pacer.current), cancel_event
+                ):
                     result["cancelled"] = True
                     break
 

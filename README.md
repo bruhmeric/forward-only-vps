@@ -123,6 +123,19 @@ DB_PATH=/app/data/forwarder.db
 # Parallel sends during /scrape (default: 5, max: 10)
 # Higher = faster but risks FloodWait
 # PARALLEL=5
+
+# ── Flood resilience (Telethon-first strategy) ─────────────────────
+# Telethon auto-sleeps + auto-retries EVERY FloodWait/SlowModeWait
+# whose wait is <= this threshold (seconds). Default 86400 = the max
+# Telethon allows = "absorb every flood wait silently".
+# ⚠️ Do NOT use None/0 hoping it means "wait forever" — Telethon turns
+# None into 0, which RAISES every FloodWaitError instead.
+# FLOOD_SLEEP_THRESHOLD=86400
+
+# Extended human-like break: pause this many seconds after every N sent
+# messages so the account-level rate budget fully recovers on long runs.
+# FLOOD_BREAK_EVERY=500
+# FLOOD_BREAK_SECONDS=300
 ```
 
 ### Step 4. Start all services
@@ -189,6 +202,7 @@ Uses `getHistory` API to read messages, then forwards them. Supports media filte
 |---|---|
 | `old` | Oldest first (chronological). Default: newest first. |
 | `saved` | Send to Saved Messages. Default: destination group. |
+| `resume` | Continue from the last checkpoint of this channel (after a crash, flood abort, or `/stop_scrape`) |
 | `photo` / `video` / `doc` / `audio` / `voice` / `animation` | Only these media types |
 | `parallel=N` | Set parallel sends (default: 5, max: 10) |
 
@@ -197,6 +211,7 @@ Uses `getHistory` API to read messages, then forwards them. Supports media filte
 /scrape https://t.me/publicchannel
 /scrape https://t.me/c/1234567890 saved old
 /scrape https://t.me/c/1234567890 photo video parallel=8
+/scrape https://t.me/c/1234567890 resume       # continue where the last run stopped
 ```
 
 **⚠️ Rate limits:** `/scrape` reads history via `get_messages` (getHistory bucket: ~10 requests / 30 s). The bot paces reads safely under that budget with an **adaptive backoff** — if Telegram still returns a FloodWait, it sleeps it off, slows the read pace, and continues. It no longer dies at ~1800 messages, but for very large channels `/scrapeid` remains the faster option.
@@ -214,6 +229,7 @@ Uses `forward_messages(ids, from_peer)` which takes message IDs directly — **n
 | `saved` | Send to Saved Messages. Default: destination group. |
 | `keep` | Keep "Forwarded from" header. Default: strip. |
 | `strip` | Strip ALL captions from media. Default: keep captions. |
+| `resume` | Continue from the last checkpoint (skips already-forwarded IDs). |
 
 **Usage:**
 ```
@@ -224,6 +240,7 @@ Uses `forward_messages(ids, from_peer)` which takes message IDs directly — **n
 /scrapeid <url> 1 5000 strip             # Strip ALL captions
 /scrapeid <url> 1 5000 keep strip        # Keep header + strip captions
 /scrapeid <url> saved strip              # Forward all to Saved Messages, strip captions
+/scrapeid <url> resume                   # Continue after a stop/crash (no duplicates)
 ```
 
 **Caption behavior:**
@@ -237,8 +254,9 @@ Uses `forward_messages(ids, from_peer)` which takes message IDs directly — **n
 **Why `/scrapeid` is faster:**
 - 100 messages per API call (vs 1 per call with getHistory)
 - Uses `forwardMessages` (send bucket) instead of `getHistory` (read bucket)
-- Adaptive pacing stays under Telegram's ~30 msgs/s account budget, so sustained runs don't trigger FloodWait cliffs
+- Adaptive, jittered pacing stays under Telegram's ~30 msgs/s account budget, so sustained runs don't trigger FloodWait cliffs
 - FloodWaits (if any) are slept off and the pace backs off automatically — the scrape never dies
+- Extended breaks + per-batch checkpoints make multi-hour 50k+ runs safe and resumable
 
 **Limitations:**
 - Can't filter by media type (forwards everything)
@@ -364,8 +382,22 @@ PARALLEL=8
 
 `/scrapeid` is tuned to run flood-free by default — no tuning needed:
 - 100 messages per API call (Telegram's max)
-- 3.5 s adaptive delay between batches (~1,700 msgs/min sustained, under the ~30 msgs/s account budget)
+- 3.5 s adaptive, **randomly-jittered** delay between batches (~1,700 msgs/min sustained, under the ~30 msgs/s account budget) — the jitter keeps the traffic pattern from looking metronomic/bot-like
 - On FloodWait: sleeps the requested time, retries the same batch, and increases the delay — never loses messages, never dies
+- Transient non-flood errors (timeouts, RPC hiccups) get exponential backoff (1s → 2s → 4s) before a batch is counted as failed
+
+### Flood resilience — how it all fits together
+
+The bot uses a layered, Telethon-first strategy:
+
+1. **Telethon built-in auto-handling** — the client is created with `flood_sleep_threshold=86400` (one day, Telethon's maximum). Every FloodWait/SlowModeWait/FloodPremiumWait ≤ 24h is silently slept off and retried *inside the library*, so most floods are invisible to the bot. (⚠️ `None` is NOT "wait forever" — Telethon converts it to 0, which raises every flood instead. Use 86400.)
+2. **Adaptive pacing** — an `AdaptivePacer` grows the inter-batch delay whenever a FloodWait still leaks through, and relaxes it after a streak of clean batches.
+3. **Human-like jitter** — every inter-batch delay is randomized to 75–160% of the pacer value, so the request pattern isn't metronomic.
+4. **Extended breaks** — after every 500 sent messages (configurable: `FLOOD_BREAK_EVERY` / `FLOOD_BREAK_SECONDS`), the bot pauses 5 minutes so the account-level budget fully recovers, like a human taking a break. `/stop_scrape` still works during breaks.
+5. **Exponential backoff** — non-flood transient errors retry with 1s → 2s → 4s delays instead of killing the scrape.
+6. **Checkpointing (state saving)** — `last_message_id` is persisted to SQLite after **every batch**. If anything does stop the run (crash, `/stop_scrape`, reboot), re-run the same command with the `resume` flag and it continues exactly where it stopped — no duplicated sends:
+   - `/scrape <url> resume` (or `/scrape <url> old resume`)
+   - `/scrapeid <url> resume`
 
 ---
 
@@ -448,10 +480,13 @@ telegram-forwarder-vps/
 
 ### `/scrape` hits FloodWait on big channels
 
-This used to be a hard failure around ~1800–2000 messages. It is now handled:
-- Read pacing (getHistory) keeps safely under Telegram's ~10 req/30 s budget with headroom
+This used to be a hard failure around ~1800–2000 messages. It is now handled by the layered flood strategy (see "Flood resilience" above):
+- Telethon itself auto-sleeps and auto-retries every flood wait up to 24h (`FLOOD_SLEEP_THRESHOLD=86400`) — most floods never reach the bot
+- Read pacing (getHistory) keeps safely under Telegram's ~10 req/30 s budget with headroom, with random human-like jitter
 - Send-side FloodWaits are slept off and retried — they no longer fall into the slow re-upload fallback
 - An adaptive pacer slows reads/sends after any FloodWait and speeds back up once quiet
+- Extended breaks (default 5 min per 500 msgs) let the account budget recover on huge runs
+- If a run still stops (crash, reboot, `/stop_scrape`), resume it with `/scrape <url> resume` — progress is checkpointed after every batch, so nothing is re-sent
 
 For very large channels, `/scrapeid` is still the recommended (and much faster) path:
 
@@ -461,6 +496,9 @@ For very large channels, `/scrapeid` is still the recommended (and much faster) 
 
 # Use:
 /scrapeid https://t.me/bigchannel
+
+# And if it ever gets interrupted:
+/scrapeid https://t.me/bigchannel resume
 ```
 
 ### `/stop_scrape` doesn't work

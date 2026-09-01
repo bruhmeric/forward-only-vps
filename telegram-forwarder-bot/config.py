@@ -45,6 +45,17 @@ class Config:
     session_string: Optional[str] = None
     # --- scrape performance ---
     default_parallel: int = 5  # default parallel sends during /scrape (was 3)
+    # --- flood resilience (Telethon-first strategy) ---
+    # Telethon auto-sleeps + auto-retries any FloodWait/SlowModeWait whose
+    # requested wait is <= this threshold (in seconds). 86400 (one day) is
+    # Telethon's maximum, i.e. "absorb EVERY flood wait silently".
+    # NOTE: None/0 does NOT mean "wait forever" — Telethon's setter turns
+    # None into 0, which RAISES every FloodWaitError instead. Use 86400.
+    flood_sleep_threshold: int = 86400
+    # Human-like pacing: take an extended break after this many sent
+    # messages (0 disables), lasting flood_break_seconds.
+    flood_break_every: int = 500
+    flood_break_seconds: int = 300
 
     @classmethod
     def load(cls) -> "Config":
@@ -77,6 +88,20 @@ class Config:
         parallel_raw = os.environ.get("PARALLEL", "").strip()
         default_parallel = max(1, min(int(parallel_raw), 10)) if parallel_raw else 5
 
+        def _env_int(name: str, default: int, lo: int = 0, hi: int = 2**31 - 1) -> int:
+            raw = os.environ.get(name, "").strip()
+            if not raw:
+                return default
+            try:
+                return max(lo, min(int(raw), hi))
+            except ValueError:
+                return default
+
+        # Flood resilience knobs (see dataclass docs above)
+        flood_sleep_threshold = _env_int("FLOOD_SLEEP_THRESHOLD", 86400, 0, 24 * 60 * 60)
+        flood_break_every = _env_int("FLOOD_BREAK_EVERY", 500)
+        flood_break_seconds = _env_int("FLOOD_BREAK_SECONDS", 300, 0, 24 * 60 * 60)
+
         return cls(
             bot_token=token,
             api_id=int(api_id_raw) if api_id_raw else None,
@@ -91,6 +116,9 @@ class Config:
             port=port,
             session_string=session_string,
             default_parallel=default_parallel,
+            flood_sleep_threshold=flood_sleep_threshold,
+            flood_break_every=flood_break_every,
+            flood_break_seconds=flood_break_seconds,
         )
 
     @property

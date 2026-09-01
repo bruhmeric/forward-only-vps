@@ -777,6 +777,7 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "Flags:\n"
             "  `old` — oldest first (chronological)\n"
             "  `saved` — send to Saved Messages (default: destination group)\n"
+            "  `resume` — continue from where the last scrape of this channel stopped\n"
             "  `photo` / `photos` — only photos\n"
             "  `video` / `videos` — only videos\n"
             "  `doc` / `docs` — only documents\n"
@@ -788,7 +789,8 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "  `/scrape https://t.me/publicchannel`\n"
             "  `/scrape https://t.me/c/1234567890 saved old`\n"
             "  `/scrape https://t.me/c/1234567890 photo video`\n"
-            "  `/scrape https://t.me/c/123 saved old videos parallel=5`",
+            "  `/scrape https://t.me/c/123 saved old videos parallel=5`\n"
+            "  `/scrape https://t.me/c/123 resume` — continue after a crash/flood",
             parse_mode="Markdown",
         )
         return
@@ -798,6 +800,7 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     raw_flags = [a.lower() for a in context.args[1:]]
     send_to_saved = "saved" in raw_flags
     oldest_first = "old" in raw_flags or "oldest" in raw_flags
+    do_resume = "resume" in raw_flags
 
     # Parse media type filters
     valid_media_types = {"photo", "video", "animation", "document", "audio", "voice"}
@@ -867,6 +870,41 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if media_types:
         filter_desc = "only: " + ", ".join(media_types)
 
+    # ── Resume from checkpoint (state saving) ────────────────────────────
+    # The last scrape's progress (last_message_id) is persisted to SQLite
+    # after every batch. `resume` picks it up so a crash / flood abort /
+    # manual stop never re-sends thousands of messages:
+    #   - newest-first: continue BELOW the checkpoint → max_id = ckpt - 1
+    #   - oldest-first: continue ABOVE the checkpoint → min_id = ckpt
+    resume_min_id = 0
+    resume_max_id = 0
+    resume_note = ""
+    if do_resume:
+        db = context.bot_data.get("db")
+        ckpt_raw = await db.get_runtime(f"scrape_checkpoint:{parsed.chat_ref}") if db else None
+        if ckpt_raw:
+            try:
+                ckpt = int(ckpt_raw)
+            except (TypeError, ValueError):
+                ckpt = 0
+            if ckpt > 0:
+                if oldest_first:
+                    resume_min_id = ckpt
+                else:
+                    resume_max_id = ckpt - 1
+                resume_note = (f"\n♻️ Resuming from checkpoint: msg {ckpt} "
+                               f"(already-sent messages are skipped)")
+                if not oldest_first and resume_max_id < 1:
+                    await update.effective_message.reply_text(
+                        "✅ Checkpoint is at the very top of the channel — nothing older to resume."
+                    )
+                    return
+        else:
+            await update.effective_message.reply_text(
+                "ℹ️ No checkpoint found for this channel — starting from the beginning.\n"
+                "(Checkpoints are saved automatically during every scrape.)"
+            )
+
     # Initial status message
     status_msg = await update.effective_message.reply_text(
         f"🔍 Starting scrape...\n\n"
@@ -874,7 +912,7 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Destination: {dest_label}\n"
         f"Order: {'oldest first' if oldest_first else 'newest first'}\n"
         f"Filter: {filter_desc}\n"
-        f"Parallel: {parallel} sends\n\n"
+        f"Parallel: {parallel} sends{resume_note}\n\n"
         f"_Use /stop_scrape to cancel, /scrape_status to check progress._",
         parse_mode="Markdown",
     )
@@ -1039,7 +1077,10 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         """Called on EVERY send completion and every message iteration.
         ONLY updates bot_data — does NOT edit the Telegram message.
         The background _status_ticker handles message edits every 2s.
-        This prevents race conditions from concurrent send completions."""
+        This prevents race conditions from concurrent send completions.
+        Also persists the per-channel checkpoint (last_message_id) to
+        SQLite after every batch, so `resume` can pick it up after a
+        crash, a flood abort, or a manual /stop_scrape."""
         context.bot_data["scrape_status"].update({
             "sent_count": result_dict.get("sent_count", 0),
             "failed_count": result_dict.get("failed_count", 0),
@@ -1051,6 +1092,17 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "in_flight": result_dict.get("in_flight", 0),
             "last_update": time.time(),
         })
+        # Checkpoint (state saving) — cheap SQLite write, never fatal
+        ckpt_id = result_dict.get("last_message_id", 0)
+        if ckpt_id:
+            _db = context.bot_data.get("db")
+            if _db:
+                try:
+                    await _db.set_runtime(
+                        f"scrape_checkpoint:{parsed.chat_ref}", str(ckpt_id)
+                    )
+                except Exception:
+                    pass
 
     # Run the scrape as a background task
     async def scrape_task():
@@ -1063,12 +1115,16 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 dest_chat_id=dest_chat_id,
                 topic_id=None,  # scraper doesn't support topics yet (use /saved for that)
                 reverse=oldest_first,
+                min_id=resume_min_id,
+                max_id=resume_max_id,
                 cancel_event=cancel_event,
                 status_callback=status_callback,
                 stats_callback=stats_callback,
                 media_types=media_types,
                 parallel=parallel,
                 custom_caption=custom_caption,
+                flood_break_every=cfg.flood_break_every,
+                flood_break_seconds=cfg.flood_break_seconds,
             )
             # ── Update cumulative stats (persisted to SQLite) ───────────────
             # These survive restarts and power the dashboard's "All-Time" stats.
@@ -1126,6 +1182,16 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
                     throughput = sent / (elapsed / 60) if elapsed > 60 else 0
 
+                    # Resume hint — a checkpoint was persisted for this
+                    # channel, so a cancelled/aborted run can continue
+                    # exactly where it stopped without re-sending anything.
+                    resume_hint = ""
+                    if last_id and (cancelled or failed == -1):
+                        resume_hint = (
+                            f"\n----------------------------------------\n"
+                            f"♻️ Continue: /scrape {url}{' old' if oldest_first else ''} resume"
+                        )
+
                     final_text = (
                         f"{status_line}\n\n"
                         f"Source:      {parsed.chat_ref}\n"
@@ -1140,6 +1206,7 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                         f"Last msg ID: {last_id}\n"
                         f"----------------------------------------\n"
                         f"Speed:       {throughput:.1f} items/min"
+                        f"{resume_hint}"
                     )
                 else:
                     final_text = (
@@ -1433,6 +1500,7 @@ async def cmd_reconnect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     new_session = UserSession(
         cfg.session_name, cfg.api_id, cfg.api_hash,
         session_string=cfg.session_string,
+        flood_sleep_threshold=cfg.flood_sleep_threshold,
     )
     ok = await new_session.start()
     if ok:
@@ -1513,15 +1581,18 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if not context.args:
         await update.effective_message.reply_text(
-            "Usage: `/scrapeid <url> [start_id] [end_id] [saved] [keep]`\n\n"
+            "Usage: `/scrapeid <url> [start_id] [end_id] [saved] [keep] [resume]`\n\n"
             "Examples:\n"
             "  `/scrapeid https://t.me/channelname`\n"
             "  `/scrapeid https://t.me/channelname 1 5000`\n"
             "  `/scrapeid https://t.me/c/1234567890 1000 2000 saved`\n"
-            "  `/scrapeid https://t.me/channelname 1 10000 keep`\n\n"
+            "  `/scrapeid https://t.me/channelname 1 10000 keep`\n"
+            "  `/scrapeid https://t.me/channelname resume` — continue after a stop\n\n"
             "Flags:\n"
             "  `saved` — send to Saved Messages instead of destination group\n"
-            "  `keep`  — keep 'Forwarded from' header (default: strip)\n\n"
+            "  `keep`  — keep 'Forwarded from' header (default: strip)\n"
+            "  `strip` — strip all media captions\n"
+            "  `resume` — continue from the last checkpoint of this channel\n\n"
             "This method uses forward_messages by ID — NO getHistory rate limits.\n"
             "Recommended for large public channels (10k+ messages).",
             parse_mode="Markdown",
@@ -1534,11 +1605,12 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     send_to_saved = "saved" in raw_flags
     keep_author = "keep" in raw_flags
     strip_captions = "strip" in raw_flags
+    do_resume = "resume" in raw_flags
 
     # Parse start_id and end_id
     start_id = 1
     end_id = 0  # 0 = auto-detect
-    id_args = [a for a in raw_flags if a not in ("saved", "keep", "strip")]
+    id_args = [a for a in raw_flags if a not in ("saved", "keep", "strip", "resume")]
     if len(id_args) >= 1:
         try:
             start_id = int(id_args[0])
@@ -1589,6 +1661,26 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
         dest_label = f"chat {dest_chat_id}"
 
+    # ── Resume from checkpoint (state saving) ────────────────────────────
+    # /scrapeid walks IDs ascending, so resume = start at ckpt + 1.
+    resume_note = ""
+    if do_resume:
+        _db = context.bot_data.get("db")
+        ckpt_raw = await _db.get_runtime(f"scrape_checkpoint:{parsed.chat_ref}") if _db else None
+        if ckpt_raw:
+            try:
+                ckpt = int(ckpt_raw)
+            except (TypeError, ValueError):
+                ckpt = 0
+            if ckpt > 0:
+                start_id = ckpt + 1
+                resume_note = (f"\n♻️ Resuming from checkpoint: msg {ckpt} "
+                               f"(starting at ID {start_id})")
+        else:
+            await update.effective_message.reply_text(
+                "ℹ️ No checkpoint found for this channel — starting from ID 1."
+            )
+
     # Initial status message
     range_str = f"{start_id} to {'auto' if end_id == 0 else end_id}"
     status_msg = await update.effective_message.reply_text(
@@ -1597,7 +1689,7 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"Destination: {dest_label}\n"
         f"ID range: {range_str}\n"
         f"Keep author: {keep_author}\n"
-        f"Strip captions: {strip_captions}\n\n"
+        f"Strip captions: {strip_captions}{resume_note}\n\n"
         f"_Uses forward_messages by ID — no getHistory rate limits._\n"
         f"_Send /stop_scrape to cancel._",
         parse_mode="Markdown",
@@ -1642,6 +1734,17 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "in_flight": result_dict.get("in_flight", 0),
             "last_update": _time.time(),
         })
+        # Checkpoint (state saving) — pick up exactly where we stopped
+        ckpt_id = result_dict.get("last_message_id", 0)
+        if ckpt_id:
+            _db = context.bot_data.get("db")
+            if _db:
+                try:
+                    await _db.set_runtime(
+                        f"scrape_checkpoint:{parsed.chat_ref}", str(ckpt_id)
+                    )
+                except Exception:
+                    pass
 
     # Run as background task
     async def scrape_task():
@@ -1657,6 +1760,8 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 stats_callback=stats_callback,
                 drop_author=not keep_author,
                 drop_media_captions=strip_captions,
+                flood_break_every=cfg.flood_break_every,
+                flood_break_seconds=cfg.flood_break_seconds,
             )
             # Update cumulative stats
             db = context.bot_data.get("db")

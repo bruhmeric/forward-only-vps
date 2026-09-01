@@ -78,6 +78,7 @@ async def post_init(app: Application) -> None:
         user_session = UserSession(
             cfg.session_name, cfg.api_id, cfg.api_hash,
             session_string=cfg.session_string,
+            flood_sleep_threshold=cfg.flood_sleep_threshold,
         )
         ok = await user_session.start()
         if ok:
