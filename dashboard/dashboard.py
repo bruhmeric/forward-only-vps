@@ -37,7 +37,7 @@ NO_STORE = {"Cache-Control": "no-store, must-revalidate"}
 # one container is running stale code (classic cause of "dashboard
 # doesn't update": docker-compose up -d was run WITHOUT --build) and the
 # dashboard shows a rebuild banner.
-EXPECTED_BOT_BUILD = "v6"
+EXPECTED_BOT_BUILD = "v8"
 
 # Shared outbound HTTP session (reused across polls instead of a new
 # connection every 3s) and a generous timeout: a busy bot can take a
@@ -341,7 +341,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
 
     <script>
-        const EXPECTED_BOT_BUILD = 'v6';
+        const EXPECTED_BOT_BUILD = 'v8';
         // Last good /stats payload + when it arrived. On transient fetch
         // failures we keep rendering it (with a "reconnecting" pill) for
         // up to 15s instead of instantly blanking everything to "Bot
@@ -571,12 +571,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         function updateCumulative(data) {
             if (!data.forwarder_online) return;
             const c = (data.forwarder || {}).cumulative || {};
+            // The bot now pushes per-message / per-batch cumulative
+            // deltas LIVE into SQLite (handlers/admin.py stats_callback),
+            // so these persisted values already tick up DURING a scrape
+            // instead of jumping at the end — the dashboard just displays
+            // them. (We deliberately do NOT overlay active jobs' live
+            // sent_count here — that would double-count, because the
+            // bot has already flushed those increments to SQLite.)
             document.getElementById('cum-scrapes').textContent = c.total_scrapes || 0;
-            document.getElementById('cum-sent').textContent = c.total_sent || 0;
-            document.getElementById('cum-failed').textContent = c.total_failed || 0;
-            document.getElementById('cum-skipped').textContent = c.total_skipped || 0;
-            document.getElementById('cum-flood').textContent = c.total_flood_waits || 0;
-            document.getElementById('cum-saved').textContent = c.total_saved_forwards || 0;
+            document.getElementById('cum-sent').textContent    = c.total_sent || 0;
+            document.getElementById('cum-failed').textContent  = c.total_failed || 0;
+            document.getElementById('cum-skipped').textContent  = c.total_skipped || 0;
+            document.getElementById('cum-flood').textContent   = c.total_flood_waits || 0;
+            document.getElementById('cum-saved').textContent   = c.total_saved_forwards || 0;
         }
 
         function updateScrape(data) {
@@ -682,6 +689,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             if (s.phase === 'flood') activity = 'Flood wait — auto-resumes';
             else if (s.phase === 'break') activity = 'Recovery break — auto-resumes';
             else if (inFlight > 0) activity = 'Sending ' + inFlight + ' item(s)...';
+            else if (kind === 'scrapeid') activity = 'Forwarding batches...';
 
             return `
                 <div class="job-card">

@@ -23,7 +23,22 @@ from typing import Optional
 # the most common "dashboard doesn't update" report turned out to be a
 # stale docker image (docker-compose up -d WITHOUT --build) still running
 # the old code.
-CODE_VERSION = "v6"
+#
+# v7: cumulative stats now update LIVE per-message/per-batch (admin.py
+# stats_callback) instead of only at scrape completion, /scrapeid fills
+# in skipped_count + cancelled + total_flood_waits cumulative, /scrapeid
+# publishes in_flight during forward batches, db.increment_stat is now
+# an atomic UPSERT. Together these fix the "dashboard All-Time cards
+# appear frozen for hours during a long scrape" symptom.
+#
+# v8: /scrapeid gained a `clean` flag (scrape_channel_by_ids_clean in
+# user_session.py) that fetches + resends each ID instead of using
+# forward_messages, so it can strip all t.me / generic URLs from text
+# and captions, strip ALL captions (media AND text-only messages —
+# forward_messages' drop_media_captions only handles media), and drop
+# the "Forwarded from" header (a fresh send has none). Slower than
+# plain /scrapeid but produces clean output.
+CODE_VERSION = "v8"
 
 try:
     from dotenv import load_dotenv

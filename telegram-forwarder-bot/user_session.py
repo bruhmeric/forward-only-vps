@@ -360,6 +360,60 @@ def _forward_kwargs(drop_author: bool, drop_media_captions: bool) -> dict:
     return kwargs
 
 
+# ---------- link / caption stripping for the /scrapeid clean path ----------
+
+# Telegram channel/group links in any form: https://t.me/foo,
+# t.me/foo, https://telegram.me/foo, telegram.me/foo, and the bare
+# /c/<id> and post-link variants. Matched WITHOUT the leading scheme
+# first so we catch bare `t.me/foo` in captions too.
+_TME_LINK_RE = re.compile(
+    r"(?:https?://)?t(?:elegram)?\.me/(?:c/)?[A-Za-z0-9_\-]+(?:/\d+)?",
+    re.IGNORECASE,
+)
+# Generic URLs (http/https/www) — strip these too so the cleaned
+# caption has no clickable link left. Run AFTER the t.me regex so the
+# t.me-specific pass removes those before the generic one sees the
+# 'https://' prefix that's already gone.
+_GENERIC_URL_RE = re.compile(
+    r"(?:https?://|www\.)[^\s<>\)\]]+",
+    re.IGNORECASE,
+)
+# Bare telegram invite links: t.me/+abc, joinchat?invite=abc — covered
+# by _TME_LINK_RE above. @username handles are NOT stripped (they're
+# mentions, not links, and stripping them would mangle legit content).
+
+
+def _strip_links(text: str | None) -> str:
+    """Remove Telegram links and generic URLs from a caption or text body.
+
+    Strips:
+      * https://t.me/foo            (public channel / post)
+      * t.me/foo                    (bare form, common in captions)
+      * https://t.me/c/123/45       (private channel / post)
+      * https://telegram.me/foo     (alt domain)
+      * https://example.com/...     (generic URLs)
+      * www.example.com/...         (bare www)
+
+    Preserves @username mentions (they're not links), preserves normal
+    text and line breaks. Collapses runs of spaces/tabs left behind by
+    removed links (but NOT newlines — a stripped link shouldn't merge
+    two lines into one) and trims trailing whitespace from each line.
+
+    Returns '' for None/empty input.
+    """
+    if not text:
+        return ""
+    cleaned = _TME_LINK_RE.sub("", text or "")
+    cleaned = _GENERIC_URL_RE.sub("", cleaned)
+    # Collapse runs of spaces/tabs (NOT newlines — we want a stripped
+    # link to leave a single space, not merge two lines).
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    # Strip trailing whitespace from each line (a stripped link often
+    # leaves "Subscribe: " with a trailing space before the newline).
+    cleaned = "\n".join(line.rstrip() for line in cleaned.split("\n"))
+    return cleaned.strip()
+
+
 # ---------- session manager ----------
 
 class UserSession:
@@ -2790,8 +2844,23 @@ class UserSession:
             msg_ids = list(range(current_id, batch_end + 1))
             result["total_seen"] += len(msg_ids)
 
+            # Publish 'in_flight' BEFORE the forward so the dashboard's
+            # /scrapeid job card shows actual batch size instead of 0
+            # (the activity label flips to 'Sending N item(s)...' and
+            # the 'In-flight' counter is non-zero while the batch is in
+            # the air). Cleared in the finally below.
+            result["in_flight"] = len(msg_ids)
+            if stats_callback:
+                try:
+                    await stats_callback(result)
+                except Exception:
+                    pass
+
             # Forward this batch (FloodWait-aware; bisects around deleted IDs)
-            await _forward_ids(msg_ids)
+            try:
+                await _forward_ids(msg_ids)
+            finally:
+                result["in_flight"] = 0
 
             if result["cancelled"]:
                 break
@@ -2799,7 +2868,8 @@ class UserSession:
                 # _forward_ids exhausted flood retries or lost the connection
                 return result
 
-            # Stats callback
+            # Stats callback — the in_flight has been reset to 0 above so
+            # the dashboard sees the settled post-batch counts.
             if stats_callback:
                 try:
                     await stats_callback(result)
@@ -2867,6 +2937,381 @@ class UserSession:
                     f"Total IDs: {result['total_seen']}\n"
                     f"Sent: {result['sent_count']}\n"
                     f"Failed: {result['failed_count']}\n"
+                    f"Flood waits: {result['flood_waits']}\n"
+                    f"Last ID: {result['last_message_id']}"
+                )
+
+        return result
+
+    # ---------- ID-based scrape + CLEAN (fetch + resend) ----------
+    # For when the user wants the speed of /scrapeid's ID-range walk BUT
+    # also wants Telegram-side cleanup that forward_messages can't do:
+    #   - strip all t.me / generic URLs from captions and text
+    #   - strip ALL captions entirely (media AND text-only messages —
+    #     the forward_messages `drop_media_captions` flag only strips
+    #     media captions, leaving text-only messages untouched)
+    #   - drop the "Forwarded from" header (naturally — a fresh send has
+    #     no forward header, so no need for the drop_author flag here)
+    #
+    # Trade-off: this path is one send_message per ID (vs one
+    # forward_messages per 100 IDs for the fast path). It also has to
+    # fetch the messages with get_messages(ids=[...]) one batch at a
+    # time. Both are SEND-bucket API calls (not getHistory), so the
+    # flood / pacing model from scrape_channel_by_ids still applies —
+    # we reuse AdaptivePacer, BreakScheduler, _flood_sleep, phase_state.
+
+    async def scrape_channel_by_ids_clean(
+        self,
+        source_chat_ref,
+        dest_chat_id,
+        start_id: int = 1,
+        end_id: int = 0,
+        cancel_event=None,
+        status_callback=None,
+        stats_callback=None,
+        strip_links: bool = True,
+        strip_captions: bool = True,
+        batch_size: int = 100,
+        batch_delay: float = 3.5,
+        flood_break_every: int = 500,
+        flood_break_seconds: int = 300,
+        phase_state: dict | None = None,
+    ) -> dict:
+        """Resend (not forward) messages by ID range, with caption /
+        text cleanup.
+
+        Activated by the /scrapeid `clean` flag. Walks IDs the same
+        way scrape_channel_by_ids does, but instead of one server-side
+        forward_messages call per 100 IDs, it:
+
+          1. fetches the batch with get_messages(ids=[...])
+          2. for each fetched message, computes the cleaned text:
+             - strip_captions=True  -> "" (bare media, no caption;
+                                         text-only messages are skipped
+                                         entirely — nothing to send)
+             - strip_links=True     -> _strip_links(original_text)
+             - both True             -> "" (captions fully stripped)
+             - both False            -> original text preserved
+          3. re-sends via send_to_destination (single-message call)
+             with custom_caption = cleaned_text. Because it's a fresh
+             send_message, the "Forwarded from" header is naturally
+             absent — no drop_author flag needed.
+
+        Returns the same result dict shape as scrape_channel_by_ids
+        so the dashboard's /scrapeid job card works unchanged.
+
+        Args:
+          strip_links:    remove t.me / generic URLs from text + captions
+          strip_captions: remove ALL captions (media + text-only msgs)
+          (the rest mirror scrape_channel_by_ids)
+        """
+        from telethon.errors import FloodWaitError
+        import asyncio as _asyncio
+        import time as _time
+
+        result = {
+            "sent_count": 0,
+            "failed_count": 0,
+            "skipped_count": 0,
+            "total_seen": 0,
+            "last_message_id": 0,
+            "cancelled": False,
+            "flood_waits": 0,
+            "in_flight": 0,
+            "started_at": time.time(),
+        }
+
+        batch_size = min(batch_size, 100)
+
+        # Resolve entities ONCE (mirrors scrape_channel_by_ids).
+        try:
+            source_entity = await self._resolve_entity(source_chat_ref, None)
+            dest_entity = await self._resolve_entity(dest_chat_id, None)
+        except Exception as e:
+            if status_callback:
+                await status_callback(f"❌ Failed to resolve entities: {type(e).__name__}: {e}")
+            result["failed_count"] = -1
+            return result
+
+        # Auto-detect end_id (mirrors scrape_channel_by_ids).
+        if end_id <= 0:
+            if status_callback:
+                await status_callback("🔍 Detecting latest message ID...")
+            try:
+                latest = await self.client.get_messages(source_entity, limit=1)
+                if latest:
+                    msg = latest[0] if isinstance(latest, list) else latest
+                    end_id = getattr(msg, "id", 0)
+                    if status_callback:
+                        await status_callback(
+                            f"✓ Latest message ID: {end_id}\n"
+                            f"  Will clean-resend IDs {start_id} to {end_id} "
+                            f"({end_id - start_id + 1} messages)"
+                        )
+                else:
+                    if status_callback:
+                        await status_callback("❌ Channel appears empty")
+                    return result
+            except Exception as e:
+                if status_callback:
+                    await status_callback(f"❌ Failed to detect latest ID: {type(e).__name__}: {e}")
+                result["failed_count"] = -1
+                return result
+
+        if end_id < start_id:
+            if status_callback:
+                await status_callback(f"❌ end_id ({end_id}) < start_id ({start_id})")
+            return result
+
+        if status_callback:
+            await status_callback(
+                f"🧹 Starting CLEAN ID-based forward: {source_chat_ref} → {dest_chat_id}\n"
+                f"   IDs {start_id} to {end_id} ({end_id - start_id + 1} messages)\n"
+                f"   strip_links: {strip_links} | strip_captions: {strip_captions}\n"
+                f"   ⚠️ Slower than plain /scrapeid (one send per ID instead\n"
+                f"   of one forwardMessages per 100 IDs) — uses the SEND\n"
+                f"   bucket, not getHistory, so the same flood / pacing model\n"
+                f"   applies."
+            )
+
+        last_status_time = 0
+        status_interval = 2.0
+
+        # Send-side pacer — same model as the fast path: 3.5 s/batch
+        # baseline ≈ 28 msgs/s stays under Telegram's ~30 msgs/s account
+        # budget, backs off on FloodWait, recovers after a clean streak.
+        send_pacer = AdaptivePacer(base=batch_delay, maximum=20.0)
+        break_sched = BreakScheduler(flood_break_every, flood_break_seconds)
+
+        # Per-message send (used after the batch fetch). Wrapped with
+        # flood-retry so a transient FloodWait doesn't kill the run.
+        async def _send_one_clean(msg) -> bool:
+            """Send one fetched message with cleaned text. Returns
+            True on success, False on failure. NEVER raises — all
+            errors are caught and counted."""
+            if msg is None:
+                result["failed_count"] += 1
+                return False
+            try:
+                original_text = msg.message or ""
+                # Compute the cleaned caption / text.
+                if strip_captions:
+                    cleaned = ""
+                elif strip_links:
+                    cleaned = _strip_links(original_text)
+                else:
+                    cleaned = original_text
+
+                # If the message is text-only and we're stripping
+                # captions OR the text is empty after link-stripping,
+                # there's nothing to send — skip it (don't send an
+                # empty message).
+                if not msg.media:
+                    if not cleaned:
+                        # Nothing meaningful left after cleaning — skip.
+                        result["skipped_count"] += 1
+                        return False
+
+                # send_to_destination with custom_caption != None
+                # bypasses its true-forward path (Step 1) and uses the
+                # re-send path (Step 2) — exactly what we want. Pass
+                # the cached entities to skip _resolve_entity.
+                flood_retries = 0
+                while True:
+                    try:
+                        success, _diag = await _asyncio.wait_for(
+                            self.send_to_destination(
+                                source_chat_id=source_entity,
+                                source_message_ids=[msg.id],
+                                dest_chat_id=dest_entity,
+                                topic_id=None,
+                                progress_callback=None,
+                                custom_caption=cleaned,
+                                source_messages=[msg],
+                                phase_state=phase_state,
+                            ),
+                            timeout=2700,
+                        )
+                        if success:
+                            return True
+                        # send_to_destination returned False — its own
+                        # diagnostics already logged the failure.
+                        result["failed_count"] += 1
+                        return False
+                    except FloodWaitError as e:
+                        result["flood_waits"] += 1
+                        flood_retries += 1
+                        if flood_retries > 4:
+                            logger.warning(
+                                "clean: msg %d still flooded after 4 "
+                                "capped waits — counting it failed", msg.id)
+                            result["failed_count"] += 1
+                            return False
+                        ready, _capped = await self._flood_sleep(
+                            float(e.seconds), cancel_event, phase_state,
+                            status_callback, where="clean send",
+                        )
+                        if not ready:
+                            result["cancelled"] = True
+                            return False
+                        # retry the same send
+                    except _asyncio.TimeoutError:
+                        logger.warning("clean: send timed out for msg %d", msg.id)
+                        result["failed_count"] += 1
+                        return False
+                    except _asyncio.CancelledError:
+                        result["cancelled"] = True
+                        return False
+                    except Exception as e:
+                        logger.warning("clean: send failed for msg %d: %s: %s",
+                                       msg.id, type(e).__name__, e)
+                        result["failed_count"] += 1
+                        return False
+            except Exception as e:
+                logger.warning("clean: _send_one_clean crashed for msg %s: %s",
+                               getattr(msg, "id", "?"), e)
+                result["failed_count"] += 1
+                return False
+
+        # Main ID-range loop — mirrors scrape_channel_by_ids.
+        current_id = start_id
+        while current_id <= end_id:
+            if cancel_event and cancel_event.is_set():
+                result["cancelled"] = True
+                break
+
+            if not await self._ensure_connected():
+                if status_callback:
+                    await status_callback("❌ Connection lost. Stopping.")
+                result["failed_count"] = -1
+                return result
+
+            batch_end = min(current_id + batch_size - 1, end_id)
+            msg_ids = list(range(current_id, batch_end + 1))
+            result["total_seen"] += len(msg_ids)
+
+            # Publish 'in_flight' BEFORE the fetch+resend so the
+            # dashboard's job card shows the live batch size (mirrors
+            # the fast-path fix; cleared in the finally below).
+            result["in_flight"] = len(msg_ids)
+            if stats_callback:
+                try:
+                    await stats_callback(result)
+                except Exception:
+                    pass
+
+            try:
+                # Fetch the batch. get_messages(ids=[...]) is one API
+                # call per batch and is a SEND-bucket call (not
+                # getHistory), so it doesn't trigger the getHistory
+                # FloodWait cliff that /scrape hits at ~1800 msgs.
+                try:
+                    fetched = await self.client.get_messages(
+                        source_entity, ids=msg_ids,
+                    )
+                except FloodWaitError as e:
+                    result["flood_waits"] += 1
+                    send_pacer.on_flood(e.seconds)
+                    ready, _capped = await self._flood_sleep(
+                        float(e.seconds), cancel_event, phase_state,
+                        status_callback, where="clean fetch",
+                    )
+                    if not ready:
+                        result["cancelled"] = True
+                        break
+                    continue  # retry the same batch
+
+                # Normalize to a list, drop Nones (deleted IDs).
+                if isinstance(fetched, list):
+                    messages = fetched
+                elif fetched is None:
+                    messages = []
+                else:
+                    messages = [fetched]
+                # get_messages preserves the requested order, so we
+                # iterate in ID-ascending order.
+                for msg in messages:
+                    if cancel_event and cancel_event.is_set():
+                        result["cancelled"] = True
+                        break
+                    ok = await _send_one_clean(msg)
+                    if ok:
+                        result["sent_count"] += 1
+                        if msg is not None and msg.id > result["last_message_id"]:
+                            result["last_message_id"] = msg.id
+                        send_pacer.on_success()
+                    if result["cancelled"]:
+                        break
+                    if result["failed_count"] == -1:
+                        # _send_one_clean signaled a fatal abort
+                        return result
+            finally:
+                result["in_flight"] = 0
+
+            # Stats callback — settled post-batch counts (in_flight=0).
+            if stats_callback:
+                try:
+                    await stats_callback(result)
+                except Exception:
+                    pass
+
+            # Periodic status update — mirrors the fast path.
+            now = _time.time()
+            if status_callback and now - last_status_time > status_interval:
+                last_status_time = now
+                elapsed = now - result["started_at"]
+                throughput = (result["sent_count"] / (elapsed / 60)
+                              if elapsed > 1 else 0)
+                pct = (result["sent_count"] / result["total_seen"] * 100
+                       if result["total_seen"] > 0 else 0)
+                await status_callback(
+                    f"🧹 CLEAN forward in progress...\n\n"
+                    f"Current ID: {batch_end} / {end_id}\n"
+                    f"Sent: {result['sent_count']}\n"
+                    f"Failed: {result['failed_count']}\n"
+                    f"Skipped: {result['skipped_count']}\n"
+                    f"Flood waits: {result['flood_waits']}\n"
+                    f"Progress: {pct:.1f}%\n"
+                    f"Speed: {throughput:.0f} items/min\n"
+                    f"Batch delay: {send_pacer.current:.1f}s (adaptive)\n"
+                    f"Elapsed: {elapsed:.0f}s"
+                )
+
+            current_id = batch_end + 1
+
+            if current_id <= end_id:
+                # Extended break — same model as the fast path.
+                if not await break_sched.maybe_break(
+                    result["sent_count"], cancel_event, status_callback,
+                    "clean send", phase_state=phase_state,
+                ):
+                    result["cancelled"] = True
+                    break
+
+                # Adaptive inter-batch delay with human jitter.
+                if not await _sleep_chunks(
+                    _human_jitter(send_pacer.current), cancel_event
+                ):
+                    result["cancelled"] = True
+                    break
+
+        # Final status
+        if status_callback:
+            if result["cancelled"]:
+                await status_callback(
+                    f"🛑 CLEAN forward cancelled.\n\n"
+                    f"Sent: {result['sent_count']}\n"
+                    f"Failed: {result['failed_count']}\n"
+                    f"Skipped: {result['skipped_count']}\n"
+                    f"Last ID: {result['last_message_id']}"
+                )
+            else:
+                await status_callback(
+                    f"✅ CLEAN forward complete!\n\n"
+                    f"Total IDs: {result['total_seen']}\n"
+                    f"Sent: {result['sent_count']}\n"
+                    f"Failed: {result['failed_count']}\n"
+                    f"Skipped (empty after clean): {result['skipped_count']}\n"
                     f"Flood waits: {result['flood_waits']}\n"
                     f"Last ID: {result['last_message_id']}"
                 )

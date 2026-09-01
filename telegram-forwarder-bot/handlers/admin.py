@@ -114,7 +114,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/test_link <url>  — diagnostic: test fetching a t.me link\n"
         "/saved <url>    — 🚀 FAST: send t.me link content to Saved Messages\n"
         "/scrape <url> [flags]  — 🤖 AUTO: scrape ALL media from a channel\n"
-        "/scrapeid <url> [start] [end] [saved] [keep]  — 🚀 FAST: forward by ID (flood-adaptive)\n"
+        "/scrapeid <url> [start] [end] [saved] [keep] [strip] [clean]  — 🚀 FAST: forward by ID (flood-adaptive)\n"
+        "    `clean` = RESEND (not forward): strip all links + ALL captions + sender header. Slower but produces clean output. Implies `strip`, overrides `keep`.\n"
         "/stop_scrape [J1|all]  — 🛑 stop one scrape (or all)\n"
         "/scrape_status  — 📊 progress of every running scrape\n"
         "\n*Parallel scrapes:* up to 2 jobs can run at once — e.g. one "
@@ -1400,29 +1401,61 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         2s. This prevents race conditions from concurrent send completions.
         Also persists the per-channel checkpoint (last_message_id) to
         SQLite after every batch, so `resume` can pick it up after a
-        crash, a flood abort, or a manual /stop_scrape."""
-        job["status"].update({
-            "sent_count": result_dict.get("sent_count", 0),
-            "failed_count": result_dict.get("failed_count", 0),
-            "skipped_count": result_dict.get("skipped_count", 0),
+        crash, a flood abort, or a manual /stop_scrape.
+
+        LIVE CUMULATIVE STATS: we also push per-delta increments into the
+        bot-wide SQLite cumulative counters here (not at scrape end). This
+        is what makes the dashboard's 'All-Time' cards tick up DURING a
+        scrape — the old behaviour only wrote cumulative stats after
+        scrape_channel() returned, so a multi-hour 50k-message scrape
+        showed 'Total Sent' FROZEN for hours and then jumped at the end,
+        which looked exactly like a broken dashboard. Bonus: a bot
+        restart mid-scrape no longer loses the scrape's contribution."""
+        st = job["status"]
+        new_sent    = int(result_dict.get("sent_count", 0) or 0)
+        new_failed  = int(result_dict.get("failed_count", 0) or 0)
+        new_skipped = int(result_dict.get("skipped_count", 0) or 0)
+        new_floods  = int(result_dict.get("flood_waits", 0) or 0)
+        # Deltas vs the previous stats_callback snapshot. Clamped at 0:
+        # the result dict is monotonically increasing per scrape, but a
+        # clamp protects against any future non-monotonic update.
+        d_sent    = max(0, new_sent    - int(st.get("sent_count", 0) or 0))
+        d_failed  = max(0, new_failed  - int(st.get("failed_count", 0) or 0))
+        d_skipped = max(0, new_skipped - int(st.get("skipped_count", 0) or 0))
+        d_floods  = max(0, new_floods  - int(st.get("flood_waits", 0) or 0))
+
+        st.update({
+            "sent_count": new_sent,
+            "failed_count": new_failed,
+            "skipped_count": new_skipped,
             "total_seen": result_dict.get("total_seen", 0),
             "last_message_id": result_dict.get("last_message_id", 0),
-            "flood_waits": result_dict.get("flood_waits", 0),
+            "flood_waits": new_floods,
             "cancelled": result_dict.get("cancelled", False),
             "in_flight": result_dict.get("in_flight", 0),
             "last_update": time.time(),
         })
+
+        _db = context.bot_data.get("db")
+        # Live cumulative update (per-delta) — never fatal.
+        if _db is not None and (d_sent or d_failed or d_skipped or d_floods):
+            try:
+                if d_sent:    await _db.increment_stat("total_sent", d_sent)
+                if d_failed:  await _db.increment_stat("total_failed", d_failed)
+                if d_skipped: await _db.increment_stat("total_skipped", d_skipped)
+                if d_floods:  await _db.increment_stat("total_flood_waits", d_floods)
+            except Exception as e:
+                logger.warning("Live cumulative stats update failed: %s", e)
+
         # Checkpoint (state saving) — cheap SQLite write, never fatal
         ckpt_id = result_dict.get("last_message_id", 0)
-        if ckpt_id:
-            _db = context.bot_data.get("db")
-            if _db:
-                try:
-                    await _db.set_runtime(
-                        f"scrape_checkpoint:{parsed.chat_ref}", str(ckpt_id)
-                    )
-                except Exception:
-                    pass
+        if ckpt_id and _db is not None:
+            try:
+                await _db.set_runtime(
+                    f"scrape_checkpoint:{parsed.chat_ref}", str(ckpt_id)
+                )
+            except Exception:
+                pass
 
     # Run the scrape as a background task
     async def scrape_task():
@@ -1448,22 +1481,24 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 phase_state=phase_state,
             )
             # ── Update cumulative stats (persisted to SQLite) ───────────────
-            # These survive restarts and power the dashboard's "All-Time" stats.
+            # Only the SCRAPE COUNT is incremented here — sent / failed /
+            # skipped / flood_waits are now pushed LIVE per-message by
+            # stats_callback (see above), so the dashboard's 'All-Time'
+            # cards tick up DURING the scrape instead of jumping at the
+            # end, and a bot restart mid-scrape no longer loses the work.
             db = context.bot_data.get("db")
             if db and isinstance(scrape_result, dict):
                 try:
                     await db.increment_stat("total_scrapes", 1)
-                    await db.increment_stat("total_sent", scrape_result.get("sent_count", 0))
-                    await db.increment_stat("total_failed", max(0, scrape_result.get("failed_count", 0)))
-                    await db.increment_stat("total_skipped", scrape_result.get("skipped_count", 0))
-                    await db.increment_stat("total_flood_waits", scrape_result.get("flood_waits", 0))
-                    logger.info("Cumulative stats updated: scrape complete "
-                                "(sent=%d, failed=%d, skipped=%d)",
+                    logger.info("Scrape %s complete (sent=%d, failed=%d, "
+                                "skipped=%d) — cumulative stats were updated "
+                                "live per-message",
+                                job.get("job_id"),
                                 scrape_result.get("sent_count", 0),
                                 scrape_result.get("failed_count", 0),
                                 scrape_result.get("skipped_count", 0))
                 except Exception as e:
-                    logger.warning("Failed to update cumulative stats: %s", e)
+                    logger.warning("Failed to increment total_scrapes: %s", e)
         except Exception as e:
             logger.exception("/scrape task failed")
             try:
@@ -1963,6 +1998,8 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
       /scrapeid <url> 1 5000 keep        — keep "Forwarded from" header
       /scrapeid <url> 1 5000 strip       — strip ALL captions from media
       /scrapeid <url> 1 5000 keep strip  — keep header AND strip captions
+      /scrapeid <url> 1 5000 clean       — RESEND (not forward): strip all
+                                           links + captions + forwarded-from
 
     This is the RECOMMENDED method for large public channels because:
     - Uses forward_messages(ids, from_peer) — no getHistory API calls
@@ -1975,6 +2012,13 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
       saved  — send to Saved Messages instead of destination group
       keep   — keep "Forwarded from" header (default: strip)
       strip  — strip ALL captions from media (default: keep captions)
+      clean  — RESEND instead of forward so we can:
+                • strip all t.me / generic URLs from text + captions
+                • strip ALL captions (media AND text-only messages)
+                • drop the "Forwarded from" header (a fresh send has none)
+               Slower than plain /scrapeid (one send per ID instead of
+               one forwardMessages per 100 IDs) but produces clean output.
+               Implies `strip` and overrides `keep`.
 
     For protected channels (content protection enabled), use /scrape instead.
     """
@@ -2005,17 +2049,21 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if not context.args:
         await update.effective_message.reply_text(
-            "Usage: `/scrapeid <url> [start_id] [end_id] [saved] [keep] [resume]`\n\n"
+            "Usage: `/scrapeid <url> [start_id] [end_id] [saved] [keep] [strip] [clean] [resume]`\n\n"
             "Examples:\n"
             "  `/scrapeid https://t.me/channelname`\n"
             "  `/scrapeid https://t.me/channelname 1 5000`\n"
             "  `/scrapeid https://t.me/c/1234567890 1000 2000 saved`\n"
             "  `/scrapeid https://t.me/channelname 1 10000 keep`\n"
+            "  `/scrapeid https://t.me/channelname 1 10000 clean` — strip links + captions + sender\n"
             "  `/scrapeid https://t.me/channelname resume` — continue after a stop\n\n"
             "Flags:\n"
-            "  `saved` — send to Saved Messages instead of destination group\n"
-            "  `keep`  — keep 'Forwarded from' header (default: strip)\n"
-            "  `strip` — strip all media captions\n"
+            "  `saved`  — send to Saved Messages instead of destination group\n"
+            "  `keep`   — keep 'Forwarded from' header (default: strip)\n"
+            "  `strip`  — strip all media captions (uses fast forward_messages)\n"
+            "  `clean`  — RESEND (not forward): strip all links + ALL captions\n"
+            "             + drop 'Forwarded from'. Slower but produces clean\n"
+            "             output. Implies `strip`, overrides `keep`.\n"
             "  `resume` — continue from the last checkpoint of this channel\n\n"
             "This method uses forward_messages by ID — NO getHistory rate limits.\n"
             "Recommended for large public channels (10k+ messages).",
@@ -2029,12 +2077,21 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     send_to_saved = "saved" in raw_flags
     keep_author = "keep" in raw_flags
     strip_captions = "strip" in raw_flags
+    do_clean = "clean" in raw_flags
     do_resume = "resume" in raw_flags
+
+    # `clean` implies `strip` (it strips captions entirely via a
+    # resend) and overrides `keep` (a fresh send has no forwarded-from
+    # header to preserve).
+    if do_clean:
+        strip_captions = True
+        keep_author = False
 
     # Parse start_id and end_id
     start_id = 1
     end_id = 0  # 0 = auto-detect
-    id_args = [a for a in raw_flags if a not in ("saved", "keep", "strip", "resume")]
+    id_args = [a for a in raw_flags
+               if a not in ("saved", "keep", "strip", "clean", "resume")]
     if len(id_args) >= 1:
         try:
             start_id = int(id_args[0])
@@ -2136,13 +2193,19 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         # Initial status message
         range_str = f"{start_id} to {'auto' if end_id == 0 else end_id}"
+        mode_line = (
+            "🧹 CLEAN mode — strip links + ALL captions + forwarded-from "
+            "(resend, not forward)"
+            if do_clean else
+            f"Keep author: {keep_author}\n"
+            f"Strip captions: {strip_captions}"
+        )
         status_msg = await update.effective_message.reply_text(
             f"🚀 Starting ID-based forward {job['job_id']}...\n\n"
             f"Source: `{parsed.chat_ref}`\n"
             f"Destination: {dest_label}\n"
             f"ID range: {range_str}\n"
-            f"Keep author: {keep_author}\n"
-            f"Strip captions: {strip_captions}{resume_note}\n\n"
+            f"{mode_line}{resume_note}\n\n"
             f"_Uses forward_messages by ID — no getHistory rate limits._\n"
             f"_Send /stop_scrape {job['job_id']} to cancel._",
             parse_mode="Markdown",
@@ -2158,7 +2221,9 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "sent_count": 0, "failed_count": 0, "skipped_count": 0,
         "total_seen": 0, "last_message_id": 0, "started_at": _time.time(),
         "source_ref": parsed.chat_ref, "dest_label": dest_label,
-        "order": "id-ascending", "filter": "ALL (forward by ID)",
+        "order": "id-ascending",
+        "filter": ("CLEAN (strip links + captions + sender)"
+                   if do_clean else "ALL (forward by ID)"),
         "parallel": 100, "in_flight": 0,
     }
     # Shared wait-phase dict — scrape_channel_by_ids publishes flood waits
@@ -2204,52 +2269,107 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await _edit_status(text, force=True)
 
     async def stats_callback(result_dict):
-        job["status"].update({
-            "sent_count": result_dict.get("sent_count", 0),
-            "failed_count": result_dict.get("failed_count", 0),
+        """Per-batch snapshot of scrape_channel_by_ids progress. Same
+        live-cumulative pattern as /scrape (see the long comment there):
+        we push per-delta increments into the bot-wide SQLite cumulative
+        counters here so the dashboard's 'All-Time' cards tick up DURING
+        the forward (the old code only wrote cumulative at completion —
+        for a 50k-ID range that meant a multi-hour frozen 'Total Sent').
+
+        Also fills in skipped_count and cancelled (the old /scrapeid
+        callback omitted both, so the dashboard's 'Skipped' card for a
+        /scrapeid job always read 0 even when batches failed) and tracks
+        flood_waits into the cumulative 'Flood Waits' card (the old
+        /scrapeid cumulative block missed total_flood_waits entirely)."""
+        st = job["status"]
+        new_sent    = int(result_dict.get("sent_count", 0) or 0)
+        new_failed  = int(result_dict.get("failed_count", 0) or 0)
+        new_skipped = int(result_dict.get("skipped_count", 0) or 0)
+        new_floods  = int(result_dict.get("flood_waits", 0) or 0)
+        d_sent    = max(0, new_sent    - int(st.get("sent_count", 0) or 0))
+        d_failed  = max(0, new_failed  - int(st.get("failed_count", 0) or 0))
+        d_skipped = max(0, new_skipped - int(st.get("skipped_count", 0) or 0))
+        d_floods  = max(0, new_floods  - int(st.get("flood_waits", 0) or 0))
+
+        st.update({
+            "sent_count": new_sent,
+            "failed_count": new_failed,
+            "skipped_count": new_skipped,
             "total_seen": result_dict.get("total_seen", 0),
             "last_message_id": result_dict.get("last_message_id", 0),
-            "flood_waits": result_dict.get("flood_waits", 0),
+            "flood_waits": new_floods,
+            "cancelled": result_dict.get("cancelled", False),
             "in_flight": result_dict.get("in_flight", 0),
             "last_update": _time.time(),
         })
+
+        _db = context.bot_data.get("db")
+        if _db is not None and (d_sent or d_failed or d_skipped or d_floods):
+            try:
+                if d_sent:    await _db.increment_stat("total_sent", d_sent)
+                if d_failed:  await _db.increment_stat("total_failed", d_failed)
+                if d_skipped: await _db.increment_stat("total_skipped", d_skipped)
+                if d_floods:  await _db.increment_stat("total_flood_waits", d_floods)
+            except Exception as e:
+                logger.warning("Live cumulative stats update failed: %s", e)
+
         # Checkpoint (state saving) — pick up exactly where we stopped
         ckpt_id = result_dict.get("last_message_id", 0)
-        if ckpt_id:
-            _db = context.bot_data.get("db")
-            if _db:
-                try:
-                    await _db.set_runtime(
-                        f"scrape_checkpoint:{parsed.chat_ref}", str(ckpt_id)
-                    )
-                except Exception:
-                    pass
+        if ckpt_id and _db is not None:
+            try:
+                await _db.set_runtime(
+                    f"scrape_checkpoint:{parsed.chat_ref}", str(ckpt_id)
+                )
+            except Exception:
+                pass
 
     # Run as background task
     async def scrape_task():
         scrape_result = None
         try:
-            scrape_result = await user_session.scrape_channel_by_ids(
-                source_chat_ref=int(parsed.chat_ref) if parsed.kind == "private" else parsed.chat_ref,
-                dest_chat_id=dest_chat_id,
-                start_id=start_id,
-                end_id=end_id,
-                cancel_event=cancel_event,
-                status_callback=status_callback,
-                stats_callback=stats_callback,
-                drop_author=not keep_author,
-                drop_media_captions=strip_captions,
-                flood_break_every=cfg.flood_break_every,
-                flood_break_seconds=cfg.flood_break_seconds,
-                phase_state=phase_state,
-            )
-            # Update cumulative stats
+            # Branch: `clean` mode fetches + resends (one send per ID,
+            # but can strip links + ALL captions + the forwarded-from
+            # header that forward_messages cannot). Plain mode uses
+            # the fast forward_messages path (100 IDs per call).
+            if do_clean:
+                scrape_result = await user_session.scrape_channel_by_ids_clean(
+                    source_chat_ref=int(parsed.chat_ref) if parsed.kind == "private" else parsed.chat_ref,
+                    dest_chat_id=dest_chat_id,
+                    start_id=start_id,
+                    end_id=end_id,
+                    cancel_event=cancel_event,
+                    status_callback=status_callback,
+                    stats_callback=stats_callback,
+                    strip_links=True,         # remove t.me + generic URLs
+                    strip_captions=True,       # remove ALL captions (media + text)
+                    flood_break_every=cfg.flood_break_every,
+                    flood_break_seconds=cfg.flood_break_seconds,
+                    phase_state=phase_state,
+                )
+            else:
+                scrape_result = await user_session.scrape_channel_by_ids(
+                    source_chat_ref=int(parsed.chat_ref) if parsed.kind == "private" else parsed.chat_ref,
+                    dest_chat_id=dest_chat_id,
+                    start_id=start_id,
+                    end_id=end_id,
+                    cancel_event=cancel_event,
+                    status_callback=status_callback,
+                    stats_callback=stats_callback,
+                    drop_author=not keep_author,
+                    drop_media_captions=strip_captions,
+                    flood_break_every=cfg.flood_break_every,
+                    flood_break_seconds=cfg.flood_break_seconds,
+                    phase_state=phase_state,
+                )
+            # Update cumulative stats — only the SCRAPE COUNT here. The
+            # per-batch counters (sent/failed/skipped/flood_waits) are now
+            # pushed LIVE by stats_callback above, so the dashboard's
+            # 'All-Time' cards tick up DURING the forward (previously they
+            # froze for the whole multi-hour range and jumped at the end).
             db = context.bot_data.get("db")
             if db and isinstance(scrape_result, dict):
                 try:
                     await db.increment_stat("total_scrapes", 1)
-                    await db.increment_stat("total_sent", scrape_result.get("sent_count", 0))
-                    await db.increment_stat("total_failed", max(0, scrape_result.get("failed_count", 0)))
                 except Exception:
                     pass
         except Exception as e:
@@ -2272,14 +2392,23 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
                     state = "CANCELLED" if cancelled else "COMPLETE"
                     status_line = f">>> SCRAPE {job['job_id']} {state} <<<"
+                    mode_label = " 🧹 CLEAN" if do_clean else ""
+                    # In clean mode the result also carries skipped_count
+                    # (text-only msgs that became empty after link-stripping
+                    # and were skipped). Show it only when non-zero so the
+                    # plain fast-path message is unchanged.
+                    skipped = scrape_result.get("skipped_count", 0)
+                    skipped_line = (f"Skipped:     {skipped} (empty after clean)\n"
+                                    if do_clean and skipped else "")
                     final_text = (
-                        f"{status_line}\n\n"
+                        f"{status_line}{mode_label}\n\n"
                         f"Source:      {parsed.chat_ref}\n"
                         f"Destination: {dest_label}\n"
                         f"Duration:    {elapsed:.0f}s\n"
                         f"----------------------------------------\n"
                         f"Sent:        {sent}\n"
                         f"Failed:      {failed}\n"
+                        f"{skipped_line}"
                         f"Total IDs:   {total}\n"
                         f"Flood waits: {flood}\n"
                         f"Last ID:     {last_id}"

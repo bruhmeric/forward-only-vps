@@ -170,15 +170,29 @@ class Database:
     async def increment_stat(self, key: str, amount: int = 1) -> int:
         """Atomically increment a cumulative stat by `amount`.
         Returns the new value. Used for: total_scrapes, total_sent,
-        total_failed, total_skipped, total_flood_waits, total_bytes_uploaded."""
-        current = await self.get_runtime(key, "0")
-        try:
-            current_int = int(current)
-        except (ValueError, TypeError):
-            current_int = 0
-        new_value = current_int + amount
-        await self.set_runtime(key, str(new_value))
-        return new_value
+        total_failed, total_skipped, total_flood_waits, total_bytes_uploaded,
+        total_saved_forwards.
+
+        ATOMIC: a single SQL UPSERT — concurrent callers cannot lose
+        increments via a read-modify-write race. This matters now that
+        stats_callback (fired by parallel _send_one tasks during a
+        /scrape, or by /scrapeid batch ticks) pushes per-delta increments
+        live into the cumulative counters; without atomicity two
+        concurrent +1 calls would both read 10 and both write 11,
+        losing one increment. SQLite's INSERT ... ON CONFLICT DO UPDATE
+        is a single statement, so the read and write happen atomically
+        inside SQLite (>= 3.24, 2018)."""
+        # No-op fast path (also avoids storing "0" on a non-existent row).
+        if not amount:
+            return await self.get_stat(key)
+        await self._conn.execute(
+            "INSERT INTO runtime_config (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET "
+            "value = CAST(CAST(value AS INTEGER) + ? AS TEXT)",
+            (key, str(amount), amount)
+        )
+        await self._conn.commit()
+        return await self.get_stat(key)
 
     async def get_stat(self, key: str, default: int = 0) -> int:
         """Get a cumulative stat as int."""

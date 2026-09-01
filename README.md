@@ -8,6 +8,7 @@ Run the **Telegram Forwarder Bot** + a **web dashboard** on a single VPS using D
 - Pull content from locked private channels via t.me links
 - Auto-scrape entire channels (`/scrape`)
 - **Bulk-forward by ID range** (`/scrapeid`) — flood-adaptive pacing, works on 50k+ message channels
+- **🧹 Clean mode** (`/scrapeid <url> clean`) — strip all links + ALL captions + sender header from bulk forwards
 - Send directly to Saved Messages (`/saved`)
 - Custom captions (`/caption`)
 - Media type filters (`/scrape <url> photo video`)
@@ -258,19 +259,21 @@ Uses `forward_messages(ids, from_peer)` which takes message IDs directly — **n
 /scrapeid <url> 1 5000                   # Forward IDs 1 to 5000
 /scrapeid <url> 1000 2000 saved          # Forward IDs 1000-2000 to Saved Messages
 /scrapeid <url> 1 5000 keep              # Keep "Forwarded from" header
-/scrapeid <url> 1 5000 strip             # Strip ALL captions
+/scrapeid <url> 1 5000 strip             # Strip ALL captions (media only)
 /scrapeid <url> 1 5000 keep strip        # Keep header + strip captions
 /scrapeid <url> saved strip              # Forward all to Saved Messages, strip captions
+/scrapeid <url> 1 5000 clean             # 🧹 RESEND: strip all links + ALL captions + sender
 /scrapeid <url> resume                   # Continue after a stop/crash (no duplicates)
 ```
 
-**Caption behavior:**
-| Flags | "Forwarded from" header | Captions |
-|---|---|---|
-| *(none — default)* | Stripped | Kept |
-| `keep` | Kept | Kept |
-| `strip` | Stripped | Stripped |
-| `keep strip` | Kept | Stripped |
+**Caption / cleanup behavior:**
+| Flags | "Forwarded from" header | Captions | Links in text |
+|---|---|---|---|
+| *(none — default)* | Stripped | Kept | Kept |
+| `keep` | Kept | Kept | Kept |
+| `strip` | Stripped | Stripped (media only) | Kept |
+| `keep strip` | Kept | Stripped (media only) | Kept |
+| `clean` | Stripped (fresh send) | Stripped (media AND text) | **Stripped** |
 
 **Why `/scrapeid` is faster:**
 - 100 messages per API call (vs 1 per call with getHistory)
@@ -279,10 +282,21 @@ Uses `forward_messages(ids, from_peer)` which takes message IDs directly — **n
 - FloodWaits (if any) are slept off and the pace backs off automatically — the scrape never dies
 - Extended breaks + per-batch checkpoints make multi-hour 50k+ runs safe and resumable
 
+**`clean` mode (link / caption / sender stripping):**
+
+`/scrapeid <url> clean` switches from the fast `forward_messages` path (one API call per 100 IDs) to a fetch + resend path (one `send_message` per ID). This is slower but can do cleanup that Telegram's `forward_messages` API cannot:
+
+- **Strip all t.me / generic URLs** from captions and text (preserves `@username` mentions — those aren't links)
+- **Strip ALL captions** — including text-only messages (the `strip` flag alone only strips media captions; text-only messages are untouched by `forward_messages`)
+- **Drop the "Forwarded from" header** — naturally, since a fresh `send_message` has no forward header to preserve
+
+Messages that become empty after cleaning (e.g. a text-only message that was just a link) are skipped and counted in the "Skipped" stat. `clean` implies `strip` and overrides `keep`.
+
 **Limitations:**
 - Can't filter by media type (forwards everything)
-- Can't apply custom captions (use `strip` flag instead)
+- Can't apply custom captions (use `strip` or `clean` flag instead)
 - Doesn't work on protected channels (use `/scrape` for those)
+- `clean` mode is slower than plain `/scrapeid` (one send per ID instead of one forward per 100 IDs) — use it only when you actually need link/caption stripping
 
 ---
 
@@ -301,9 +315,10 @@ Uses `forward_messages(ids, from_peer)` which takes message IDs directly — **n
 
 ```
 /scrapeid <url>                    — default (keep captions, strip header)
-/scrapeid <url> strip              — strip captions
+/scrapeid <url> strip              — strip media captions
 /scrapeid <url> keep               — keep "Forwarded from" header
 /scrapeid <url> keep strip         — keep header, strip captions
+/scrapeid <url> clean              — 🧹 RESEND: strip all links + ALL captions + sender header
 ```
 
 ---
@@ -577,6 +592,7 @@ sudo ufw allow 8080/tcp    # Dashboard
 | Forward to Saved Messages | `/scrapeid https://t.me/channel saved` |
 | Strip captions | `/scrapeid https://t.me/channel strip` |
 | Keep "Forwarded from" | `/scrapeid https://t.me/channel keep` |
+| 🧹 Strip links + ALL captions + sender | `/scrapeid https://t.me/channel clean` |
 | Small channel with filters | `/scrape https://t.me/channel photo video` |
 | Protected channel | `/scrape https://t.me/c/123 saved` |
 | Stop any scrape | `/stop_scrape` |
