@@ -361,8 +361,32 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 const speed = elapsed > 0 ? (s.sent_count / (elapsed / 60)).toFixed(1) : 0;
                 const inFlight = s.in_flight || 0;
 
+                // Live wait phase (flood wait / recovery break) with a
+                // ticking countdown — makes long waits clearly visible
+                // instead of looking like a frozen dashboard.
+                let phaseHtml = '';
+                if (s.phase) {
+                    const left = s.phase_seconds_left || 0;
+                    const mm = Math.floor(left / 60), ss = Math.floor(left % 60);
+                    const leftStr = left >= 3600
+                        ? Math.floor(left/3600) + 'h' + String(mm%60).padStart(2,'0') + 'm'
+                        : mm + 'm' + String(ss).padStart(2,'0') + 's';
+                    const label = s.phase === 'break' ? '☕ Recovery break'
+                                : s.phase === 'flood' ? '⏳ Flood wait' : '⏳ ' + s.phase;
+                    const color = s.phase === 'break' ? '#3b82f6' : '#f59e0b';
+                    phaseHtml = `<div style="margin-bottom:8px; color:${color}; font-weight:600; font-size:14px;">${label}: ${leftStr} remaining</div>`;
+                }
+
+                // Liveness: how long since the last real progress update
+                let livenessHtml = '';
+                if (s.seconds_since_progress != null && s.seconds_since_progress > 30) {
+                    livenessHtml = `<div style="margin-bottom:8px; color:#6b7280; font-size:12px;">Last progress ${Math.floor(s.seconds_since_progress)}s ago</div>`;
+                }
+
                 let activity = 'Scanning...';
-                if (inFlight > 0) activity = 'Sending ' + inFlight + ' item(s)...';
+                if (s.phase === 'flood') activity = 'Flood wait — auto-resumes';
+                else if (s.phase === 'break') activity = 'Recovery break — auto-resumes';
+                else if (inFlight > 0) activity = 'Sending ' + inFlight + ' item(s)...';
                 else if (s.flood_waits > 0) activity = 'Flood wait...';
 
                 content.innerHTML = `
@@ -374,6 +398,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         <strong>Parallel:</strong> ${s.parallel || 5}
                     </div>
                     <div style="margin-bottom:8px; color:#10b981; font-weight:600; font-size:14px;">${activity}</div>
+                    ${phaseHtml}
+                    ${livenessHtml}
                     <div class="progress-bar-container">
                         <div class="progress-bar-fill" style="width:${pct}%"></div>
                         <div class="progress-text">${pct.toFixed(0)}%</div>

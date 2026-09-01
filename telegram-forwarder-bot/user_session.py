@@ -192,6 +192,74 @@ def _human_jitter(base: float, lo: float = 0.75, hi: float = 1.6) -> float:
     return random.uniform(base * lo, base * hi)
 
 
+# ---------- visible-wait phase reporting ----------
+# A "phase_state" is a plain dict shared BY REFERENCE between the scrape
+# coroutines and the bot's status ticker / dashboard:
+#   {"key": "flood"|"break"|"backoff"|None, "until": <epoch deadline>,
+#    "note": "<human sentence>", "updated": <epoch ts>}
+# While a wait is in progress the ticker renders a LIVE countdown from
+# `until`, so a 20-minute server-requested FloodWait shows up as
+# "[FLOOD WAIT] 1187s remaining (resumes 15:42)" instead of a frozen
+# status message that looks like a hang. This exists because round-2
+# absorbed every flood wait silently inside Telethon
+# (flood_sleep_threshold=86400): the scrapes never crashed, but during
+# long waits NOTHING updated — bot message frozen, dashboard frozen,
+# /stop_scrape unresponsive — which users understandably read as "stuck
+# at budget recovery".
+
+def _set_phase(phase_state, key: str, seconds: float, note: str = "") -> None:
+    """Publish a waiting phase with a deadline `seconds` from now."""
+    if phase_state is None:
+        return
+    try:
+        phase_state.update({
+            "key": key,
+            "until": time.time() + max(0.0, float(seconds)),
+            "note": str(note or key),
+            "updated": time.time(),
+        })
+    except Exception:
+        pass
+
+
+def _clear_phase(phase_state) -> None:
+    """Mark the waiting phase over (normal work resumed)."""
+    if phase_state is None:
+        return
+    try:
+        phase_state.update({"key": None, "until": 0.0, "note": "", "updated": time.time()})
+    except Exception:
+        pass
+
+
+async def _wait_visible(seconds, cancel_event=None, phase_state=None,
+                         phase_key: str = "flood", status_callback=None,
+                         announce: str | None = None, chunk: float = 5.0) -> bool:
+    """Sleep `seconds` with LIVE status visibility.
+
+    Combines everything a long server-requested wait needs:
+      1. one milestone announcement via `status_callback` (if given)
+      2. a published phase + deadline so tickers/dashboards render a live
+         countdown while we sleep
+      3. chunked, cancel-aware sleeping (/stop_scrape works mid-wait)
+
+    Returns True if the full wait elapsed, False if cancelled mid-wait.
+    """
+    seconds = max(0.0, float(seconds or 0))
+    if seconds <= 0:
+        return True
+    _set_phase(phase_state, phase_key, seconds, announce or phase_key)
+    if status_callback and announce:
+        try:
+            await status_callback(announce)
+        except Exception:
+            pass
+    try:
+        return await _sleep_chunks(seconds, cancel_event, chunk=chunk)
+    finally:
+        _clear_phase(phase_state)
+
+
 class BreakScheduler:
     """Take an extended, cancel-aware break every N sent messages.
 
@@ -209,11 +277,19 @@ class BreakScheduler:
         self.breaks_taken = 0
 
     async def maybe_break(self, sent_count: int, cancel_event=None,
-                          status_callback=None, label: str = "forward") -> bool:
+                          status_callback=None, label: str = "forward",
+                          phase_state=None) -> bool:
         """Sleep if we've advanced `every` messages since the last break.
 
-        Returns True if a break was taken; False if cancelled mid-break
-        (callers should treat a cancelled break as a cancel of the run).
+        The break is published to `phase_state` (if given) so the status
+        ticker and dashboard render a LIVE countdown — the one-shot
+        "taking a break" message used previously was clobbered by the
+        next ticker update and a 5-minute silent break was indistinguish-
+        able from a hang.
+
+        Returns True if a break was taken (or none was due); False if
+        cancelled mid-break (callers should treat a cancelled break as a
+        cancel of the run).
         """
         if self.every <= 0 or self.seconds <= 0:
             return True
@@ -226,13 +302,18 @@ class BreakScheduler:
                 await status_callback(
                     f"☕ Extended break #{self.breaks_taken}: {self.seconds:.0f}s "
                     f"after {sent_count} {label}ed messages (rate-budget recovery). "
-                    f"Send /stop_scrape to cancel."
+                    f"The status line shows a live countdown. /stop_scrape works."
                 )
             except Exception:
                 pass
-        if not await _sleep_chunks(self.seconds, cancel_event, chunk=5.0):
-            return False
-        return True
+        # Publish the break phase FIRST so the countdown starts ticking
+        # even if the announce above was rate-limited away.
+        _set_phase(phase_state, "break", self.seconds,
+                   f"rate-budget recovery break #{self.breaks_taken}")
+        try:
+            return await _sleep_chunks(self.seconds, cancel_event, chunk=5.0)
+        finally:
+            _clear_phase(phase_state)
 
 
 _FORWARD_SUPPORTS_DROP_MEDIA_CAPTIONS: Optional[bool] = None
@@ -268,7 +349,7 @@ def _forward_kwargs(drop_author: bool, drop_media_captions: bool) -> dict:
 class UserSession:
     def __init__(self, session_name: str, api_id: int, api_hash: str,
                  session_string: Optional[str] = None,
-                 flood_sleep_threshold: int = 86400) -> None:
+                 flood_sleep_threshold: int = 60) -> None:
         """Create a Telethon client backed by either a file-based session
         (session_name) or a StringSession (session_string). StringSession is
         preferred for ephemeral filesystems like Render's free tier.
@@ -280,16 +361,19 @@ class UserSession:
         flood_sleep_threshold (Telethon-first flood strategy):
             Telethon BUILTS IN auto-sleep + auto-retry for FloodWait /
             FloodPremiumWait / SlowModeWait errors whose requested wait is
-            <= this threshold (seconds). With the default 86400 (Telethon's
-            hard maximum — anything larger is clamped to one day) EVERY
-            flood wait is absorbed invisibly inside the request call, so
-            scrapes can no longer die from FloodWait at all.
+            <= this threshold (seconds). Short waits (the common case) are
+            absorbed invisibly inside the request call. LONGER waits raise
+            FloodWaitError to our code, which publishes a live countdown
+            to the status message + dashboard (phase_state / _wait_visible),
+            sleeps the requested time in cancel-aware chunks, and retries —
+            so long waits are both survivable AND visible.
 
-            ⚠️ DO NOT pass None. Unlike what some old snippets claim,
-            Telethon's setter converts None to 0 — which RAISES every
-            FloodWaitError instead of sleeping. 0 = full manual control,
-            86400 = "wait for anything". Our own except-FloodWait blocks
-            remain as a fallback for the (rare) >24h waits.
+            Default 60. ⚠️ DO NOT pass None: Telethon's setter converts
+            None to 0, which RAISES every FloodWaitError immediately.
+            0 = full manual control, 86400 = "absorb everything silently"
+            (NOT recommended: during multi-hour flood waits nothing updates
+            and the bot looks completely stuck — the exact "stuck at budget
+            recovery" bug this default fixes).
         """
         client_kwargs = dict(
             api_id=api_id,
@@ -301,8 +385,9 @@ class UserSession:
             retry_delay=2,           # 2s between retries
             auto_reconnect=True,     # reconnect automatically on disconnect
             request_retries=3,       # retry failed requests 3 times
-            # Let Telethon itself sleep off + retry every flood wait up to
-            # one day (its maximum) instead of raising FloodWaitError.
+            # Waits <= this threshold: Telethon sleeps + retries silently.
+            # Longer waits: FloodWaitError raised to our VISIBLE handler
+            # (live countdown, cancel-aware sleep, retry the same batch).
             flood_sleep_threshold=min(int(flood_sleep_threshold or 0), 24 * 60 * 60),
         )
         if session_string:
@@ -749,6 +834,7 @@ class UserSession:
         progress_callback=None,
         custom_caption: str | None = None,
         source_messages: list | None = None,
+        phase_state: dict | None = None,
     ) -> tuple[bool, list[str]]:
         """Send message(s) from a source chat to the destination chat using
         the user account (Telethon). This is the NEW fast path that avoids
@@ -893,7 +979,10 @@ class UserSession:
                         f"⏳ FloodWait {fw_err.seconds}s on true forward — sleeping and "
                         f"retrying ({forward_flood_tries}/2); NOT falling back to re-upload"
                     )
-                    await _sleep_chunks(float(fw_err.seconds) + 2)
+                    # Visible wait: publishes a live countdown to the status
+                    # ticker / dashboard instead of sleeping invisibly.
+                    await _wait_visible(float(fw_err.seconds) + 2,
+                                        phase_state=phase_state, phase_key="flood")
                 except Exception as forward_err:
                     diag.append(f"⚠ True forward failed: {type(forward_err).__name__}: {forward_err}")
                     diag.append("  → Falling back to copy-and-resend (for protected content)")
@@ -1010,7 +1099,9 @@ class UserSession:
                             f"⏳ FloodWait {fw_err.seconds}s on send_message — sleeping and "
                             f"retrying ({send_flood_tries}/2)"
                         )
-                        await _sleep_chunks(float(fw_err.seconds) + 2)
+                        await _wait_visible(float(fw_err.seconds) + 2,
+                                            phase_state=phase_state,
+                                            phase_key="flood")
             except FloodWaitError:
                 # Persistent flood — abort the whole send so the caller can
                 # apply its own backoff. Falling through to Step 3 (full
@@ -1690,6 +1781,7 @@ class UserSession:
         custom_caption: str | None = None,
         flood_break_every: int = 500,
         flood_break_seconds: int = 300,
+        phase_state: dict | None = None,
     ) -> dict:
         """Iterate all messages in a channel and forward each media message
         to the destination chat. Used by the /scrape command.
@@ -1855,6 +1947,7 @@ class UserSession:
                         progress_callback=None,
                         custom_caption=custom_caption,
                         source_messages=[msg],         # pass the msg directly!
+                        phase_state=phase_state,
                     ),
                     timeout=600,
                 )
@@ -1866,13 +1959,16 @@ class UserSession:
             except FloodWaitError as e:
                 result["flood_waits"] += 1
                 wait_seconds = e.seconds + 5
-                if status_callback:
-                    await status_callback(
-                        f"⏳ Flood wait: sleeping {wait_seconds}s before retrying...\n"
-                        f"   Sent so far: {result['sent_count']}"
-                    )
-                # Sleep in chunks so we can be interrupted by cancel
-                if not await _sleep_chunks(wait_seconds, cancel_event):
+                # Visible wait with a live countdown in the status line.
+                if not await _wait_visible(
+                    wait_seconds, cancel_event, phase_state, "flood",
+                    status_callback,
+                    announce=(
+                        f"⏳ Flood wait on send: sleeping {wait_seconds}s before "
+                        f"retrying... Sent so far: {result['sent_count']} — a live "
+                        f"countdown is shown in the status line."
+                    ),
+                ):
                     result["failed_count"] += 1
                     return False
                 # Retry once
@@ -1886,6 +1982,7 @@ class UserSession:
                             progress_callback=None,
                             custom_caption=custom_caption,
                             source_messages=[msg],
+                            phase_state=phase_state,
                         ),
                         timeout=600,
                     )
@@ -2024,15 +2121,20 @@ class UserSession:
                     result["flood_waits"] += 1
                     wait_seconds = e.seconds + 2
                     new_pace = read_pacer.on_flood(e.seconds)
-                    if status_callback:
-                        await status_callback(
+                    # Visible wait — the status message / dashboard shows a
+                    # LIVE countdown ("[FLOOD WAIT] 1187s remaining") while
+                    # we sleep, and /stop_scrape stays responsive.
+                    await _wait_visible(
+                        wait_seconds, cancel_event, phase_state, "flood",
+                        status_callback,
+                        announce=(
                             f"⏳ Flood wait on get_messages: sleeping {wait_seconds}s "
                             f"(attempt {attempt+1}/{MAX_FLOOD_RETRIES})...\n"
                             f"   Sent so far: {result['sent_count']}, Seen: {result['total_seen']}\n"
-                            f"   Read pace auto-adjusted to {new_pace:.1f}s/batch"
-                        )
-                    # Sleep in chunks so we can be interrupted by cancel
-                    await _sleep_chunks(wait_seconds, cancel_event)
+                            f"   Read pace auto-adjusted to {new_pace:.1f}s/batch\n"
+                            f"   A live countdown is shown in the status line."
+                        ),
+                    )
                     if cancel_event and cancel_event.is_set():
                         break
                     # Retry the same batch (offset_id unchanged)
@@ -2248,7 +2350,8 @@ class UserSession:
             # Every flood_break_every sends, pause flood_break_seconds so
             # the account-level budget fully recovers. Cancel-aware.
             if not await break_sched.maybe_break(
-                result["sent_count"], cancel_event, status_callback, "sent"
+                result["sent_count"], cancel_event, status_callback, "sent",
+                phase_state=phase_state,
             ):
                 result["cancelled"] = True
                 break
@@ -2308,6 +2411,7 @@ class UserSession:
         batch_delay: float = 3.5,
         flood_break_every: int = 500,
         flood_break_seconds: int = 300,
+        phase_state: dict | None = None,
     ) -> dict:
         """Forward messages from a public channel by ID range — NO getHistory.
 
@@ -2475,14 +2579,19 @@ class UserSession:
                     result["flood_waits"] += 1
                     wait = e.seconds + 2
                     new_pace = send_pacer.on_flood(e.seconds)
-                    if status_callback:
-                        await status_callback(
+                    # Visible wait: live countdown in the status line while
+                    # we sleep off the server-requested wait.
+                    await _wait_visible(
+                        wait, cancel_event, phase_state, "flood",
+                        status_callback,
+                        announce=(
                             f"⏳ FloodWait: sleeping {wait}s "
                             f"(attempt {attempt+1}/{MAX_FLOOD_RETRIES})...\n"
                             f"   Sent so far: {result['sent_count']}\n"
-                            f"   Batch delay auto-adjusted to {new_pace:.1f}s"
-                        )
-                    await _sleep_chunks(wait, cancel_event)
+                            f"   Batch delay auto-adjusted to {new_pace:.1f}s\n"
+                            f"   A live countdown is shown in the status line."
+                        ),
+                    )
                     if cancel_event and cancel_event.is_set():
                         result["cancelled"] = True
                         return
@@ -2598,7 +2707,8 @@ class UserSession:
                 # recovers — long ranges accumulate pressure even at a
                 # flood-free per-batch pace. Cancel-aware via _sleep_chunks.
                 if not await break_sched.maybe_break(
-                    result["sent_count"], cancel_event, status_callback, "forward"
+                    result["sent_count"], cancel_event, status_callback, "forward",
+                    phase_state=phase_state,
                 ):
                     result["cancelled"] = True
                     break

@@ -1,6 +1,7 @@
 """Admin commands: /setgroup, /refresh, /addtopic, /help, /status."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -702,6 +703,153 @@ async def cmd_saved(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+# ── Shared live-status machinery (used by BOTH /scrape and /scrapeid) ──
+# The status message used to freeze during long flood waits / recovery
+# breaks: the counts didn't change, so the 2s ticker rebuilt an identical
+# text and Telegram answered "message is not modified". To a user that is
+# indistinguishable from a hang. These helpers render the ACTIVE WAIT PHASE
+# (published by user_session via the shared phase_state dict) as a live
+# countdown — the text now changes every tick while we wait, so the message
+# visibly counts down and "Last progress: Xs ago" shows liveness.
+
+def _new_phase_state() -> dict:
+    """Fresh shared-by-reference wait-phase dict (see user_session._set_phase)."""
+    return {"key": None, "until": 0.0, "note": "", "updated": 0.0}
+
+
+def _fmt_countdown(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds >= 3600:
+        return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+    if seconds >= 60:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds}s"
+
+
+def _scrape_phase_line(context) -> str:
+    """Live one-line status of the current wait phase ('' while working)."""
+    ph = context.bot_data.get("scrape_phase") or {}
+    key = ph.get("key")
+    if not key:
+        return ""
+    remaining = float(ph.get("until", 0.0)) - time.time()
+    if remaining <= 0:
+        return f"[{str(key).upper()}] wrapping up..."
+    resume = time.strftime("%H:%M", time.localtime(time.time() + remaining))
+    label = {"break": "RECOVERY BREAK", "flood": "FLOOD WAIT"}.get(key, str(key).upper())
+    return (f"[{label}] {_fmt_countdown(remaining)} remaining "
+            f"(resumes ~{resume}) — /stop_scrape works")
+
+
+def _build_scrape_live_text(context, started_at: float) -> str:
+    """Build the live status text from bot_data: counts + active wait phase
+    + liveness. Shared by the /scrape and /scrapeid status tickers."""
+    st = context.bot_data.get("scrape_status", {})
+    sent = st.get("sent_count", 0)
+    failed = st.get("failed_count", 0)
+    skipped = st.get("skipped_count", 0)
+    total_seen = st.get("total_seen", 0)
+    in_flight = st.get("in_flight", 0)
+    flood_waits = st.get("flood_waits", 0)
+    last_msg_id = st.get("last_message_id", 0)
+
+    elapsed = time.time() - started_at
+    if elapsed < 1:
+        elapsed = 1
+    throughput = sent / (elapsed / 60) if elapsed > 0 else 0
+
+    # Simple progress bar using ASCII characters
+    if total_seen > 0:
+        progress = min(1.0, sent / total_seen)
+        bar_len = 10
+        filled = int(progress * bar_len)
+        bar = "=" * filled + "-" * (bar_len - filled)
+        pct = progress * 100
+    else:
+        bar = "-" * 10
+        pct = 0
+
+    # Activity: the live wait phase (if any) is the single source of truth
+    # for "currently waiting" — flood_waits is a HISTORICAL counter and must
+    # not claim the bot is flood-waiting right now (that misled users into
+    # thinking a working scrape was stuck).
+    phase = _scrape_phase_line(context)
+    if phase:
+        activity = phase
+    elif in_flight > 0:
+        activity = f"[SENDING] {in_flight} item(s) in flight"
+    else:
+        activity = "[SCANNING]"
+
+    # Liveness indicator: how long since the last REAL progress update?
+    idle_str = ""
+    last_upd = st.get("last_update", 0)
+    if last_upd:
+        idle = time.time() - last_upd
+        if idle > 30:
+            idle_str = f"\nLast progress: {_fmt_countdown(idle)} ago"
+
+    # ETA if we have throughput data
+    eta_str = ""
+    if throughput > 0 and total_seen > sent:
+        remaining = total_seen - sent
+        eta_sec = remaining / (throughput / 60)
+        if eta_sec > 60:
+            eta_str = f"\nETA:       {eta_sec/60:.0f}m {eta_sec%60:.0f}s"
+        else:
+            eta_str = f"\nETA:       {eta_sec:.0f}s"
+
+    return (
+        f">>> SCRAPE IN PROGRESS <<<\n"
+        f"{activity}\n\n"
+        f"Progress: [{bar}] {pct:.0f}%\n"
+        f"----------------------------------------\n"
+        f"Sent:      {sent}\n"
+        f"In-flight: {in_flight}\n"
+        f"Failed:    {failed}\n"
+        f"Skipped:   {skipped}\n"
+        f"Seen:      {total_seen}\n"
+        f"----------------------------------------\n"
+        f"Elapsed:   {elapsed:.0f}s\n"
+        f"Speed:     {throughput:.1f} items/min\n"
+        f"Last ID:   {last_msg_id}"
+        f"{idle_str}"
+        f"{eta_str}"
+    )
+
+
+async def _run_scrape_status_ticker(context, edit_fn, started_at: float,
+                                    interval: float = 2.0):
+    """Background loop refreshing the status message every `interval` seconds.
+
+    While a wait phase (flood/break) is active the text contains a live
+    countdown, so it CHANGES every tick — the edit goes through and the
+    user sees the countdown ticking. When nothing changed, Telegram replies
+    "message is not modified", which the edit helper silently ignores.
+    """
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            task = context.bot_data.get("scrape_task")
+            if task and task.done():
+                # Scrape finished — one final update, then exit
+                try:
+                    await edit_fn(_build_scrape_live_text(context, started_at),
+                                  force=True)
+                except Exception:
+                    pass
+                break
+            try:
+                await edit_fn(_build_scrape_live_text(context, started_at),
+                              force=False)
+            except Exception:
+                pass
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning("status ticker error: %s", e)
+
+
 async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Scrape a channel — send all media (photos/videos) to destination.
 
@@ -933,6 +1081,11 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "filter": filter_desc,
         "parallel": parallel,
     }
+    # Shared wait-phase dict — scrape_channel publishes flood waits and
+    # recovery breaks here; the ticker renders them as LIVE countdowns so
+    # a long wait never looks like a hang again.
+    phase_state = _new_phase_state()
+    context.bot_data["scrape_phase"] = phase_state
 
     # ── Real-time status update system ─────────────────────────────────────
     # Design:
@@ -976,90 +1129,17 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 return False
 
     def _build_live_status_text() -> str:
-        """Build a simple, clean status message from bot_data.
-        Uses plain ASCII characters to avoid rendering issues on
-        Telegram clients that don't support all Unicode emoji."""
-        st = context.bot_data.get("scrape_status", {})
-        sent = st.get("sent_count", 0)
-        failed = st.get("failed_count", 0)
-        skipped = st.get("skipped_count", 0)
-        total_seen = st.get("total_seen", 0)
-        in_flight = st.get("in_flight", 0)
-        flood_waits = st.get("flood_waits", 0)
-        last_msg_id = st.get("last_message_id", 0)
-
-        elapsed = time.time() - started_at
-        if elapsed < 1:
-            elapsed = 1
-        throughput = sent / (elapsed / 60) if elapsed > 0 else 0
-
-        # Simple progress bar using ASCII characters
-        if total_seen > 0:
-            progress = min(1.0, sent / total_seen) if total_seen > 0 else 0
-            bar_len = 10
-            filled = int(progress * bar_len)
-            bar = "=" * filled + "-" * (bar_len - filled)
-            pct = progress * 100
-        else:
-            bar = "-" * 10
-            pct = 0
-
-        # Activity indicator (plain text, no emoji)
-        if in_flight > 0:
-            activity = f"[SENDING] {in_flight} item(s) in flight"
-        elif flood_waits > 0:
-            activity = "[FLOOD WAIT]"
-        else:
-            activity = "[SCANNING]"
-
-        # Calculate ETA if we have throughput data
-        eta_str = ""
-        if throughput > 0 and total_seen > sent:
-            remaining = total_seen - sent
-            eta_sec = remaining / (throughput / 60)
-            if eta_sec > 60:
-                eta_str = f"\nETA:       {eta_sec/60:.0f}m {eta_sec%60:.0f}s"
-            else:
-                eta_str = f"\nETA:       {eta_sec:.0f}s"
-
-        return (
-            f">>> SCRAPE IN PROGRESS <<<\n"
-            f"{activity}\n\n"
-            f"Progress: [{bar}] {pct:.0f}%\n"
-            f"----------------------------------------\n"
-            f"Sent:      {sent}\n"
-            f"In-flight: {in_flight}\n"
-            f"Failed:    {failed}\n"
-            f"Skipped:   {skipped}\n"
-            f"Seen:      {total_seen}\n"
-            f"----------------------------------------\n"
-            f"Elapsed:   {elapsed:.0f}s\n"
-            f"Speed:     {throughput:.1f} items/min\n"
-            f"Last ID:   {last_msg_id}"
-            f"{eta_str}"
-        )
+        # Shared builder (module level, above): counts + active wait phase
+        # with LIVE countdown + "Last progress: Xs ago" liveness line.
+        return _build_scrape_live_text(context, started_at)
 
     async def _status_ticker():
         """Background task that updates the Telegram message every 2 seconds.
         This is the ONLY thing that edits the message during a scrape —
-        stats_callback just updates bot_data, avoiding race conditions."""
-        while True:
-            try:
-                await _asyncio.sleep(2.0)
-                # Check if scrape is still running
-                task = context.bot_data.get("scrape_task")
-                if task and task.done():
-                    # Scrape finished — do one final update then exit
-                    text = _build_live_status_text()
-                    await _edit_telegram_message_safe(text, force=True)
-                    break
-                # Update the message with current counts
-                text = _build_live_status_text()
-                await _edit_telegram_message_safe(text, force=False)
-            except _asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.warning("status ticker error: %s", e)
+        stats_callback just updates bot_data, avoiding race conditions.
+        Delegates to the shared _run_scrape_status_ticker."""
+        await _run_scrape_status_ticker(context, _edit_telegram_message_safe,
+                                        started_at)
 
     # Start the background ticker
     ticker_task_ref["task"] = _asyncio.create_task(_status_ticker())
@@ -1125,6 +1205,7 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 custom_caption=custom_caption,
                 flood_break_every=cfg.flood_break_every,
                 flood_break_seconds=cfg.flood_break_seconds,
+                phase_state=phase_state,
             )
             # ── Update cumulative stats (persisted to SQLite) ───────────────
             # These survive restarts and power the dashboard's "All-Time" stats.
@@ -1220,6 +1301,7 @@ async def cmd_scrape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             # Clean up the scrape state when done
             context.bot_data.pop("scrape_task", None)
             context.bot_data.pop("scrape_cancel", None)
+            context.bot_data.pop("scrape_phase", None)
 
     context.bot_data["scrape_task"] = asyncio.create_task(scrape_task())
     logger.info("Scrape started for %s -> %s", parsed.chat_ref, dest_label)
@@ -1413,6 +1495,21 @@ async def cmd_scrape_status(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     running = task and not task.done()
     elapsed = time.time() - status.get("started_at", 0) if status.get("started_at") else 0
     state_str = "🟢 running" if running else "🔴 finished"
+
+    # Live wait phase (flood wait / recovery break) with countdown, plus a
+    # liveness line — so "waiting 20 min for the rate budget" is clearly
+    # distinguishable from "hung".
+    phase_str = ""
+    if running:
+        pl = _scrape_phase_line(context)
+        if pl:
+            phase_str = f"\n⏳ Currently: {pl}\n"
+    liveness_str = ""
+    last_upd = status.get("last_update", 0)
+    if running and last_upd:
+        idle = time.time() - last_upd
+        liveness_str = f"\nLast progress: {_fmt_countdown(idle)} ago"
+
     await update.effective_message.reply_text(
         f"📊 Scrape status: {state_str}\n\n"
         f"Source: `{status.get('source_ref', '?')}`\n"
@@ -1420,7 +1517,9 @@ async def cmd_scrape_status(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         f"Order: {status.get('order', '?')}\n"
         f"Filter: {status.get('filter', 'ALL media')}\n"
         f"Parallel: {status.get('parallel', 3)}\n"
-        f"Elapsed: {elapsed:.0f} sec\n\n"
+        f"Elapsed: {elapsed:.0f} sec\n"
+        f"{phase_str}"
+        f"{liveness_str}\n\n"
         f"Total seen: {status.get('total_seen', 0)}\n"
         f"Sent: {status.get('sent_count', 0)}\n"
         f"Failed: {status.get('failed_count', 0)}\n"
@@ -1705,20 +1804,44 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "order": "id-ascending", "filter": "ALL (forward by ID)",
         "parallel": 100, "in_flight": 0,
     }
+    # Shared wait-phase dict — scrape_channel_by_ids publishes flood waits
+    # and recovery breaks here; the ticker below renders them as LIVE
+    # countdowns. /scrapeid previously had NO ticker at all, so its status
+    # message went completely static during breaks/flood waits — exactly
+    # the "stuck, nothing updates" symptom.
+    phase_state = _new_phase_state()
+    context.bot_data["scrape_phase"] = phase_state
 
-    # Status callbacks
+    # Status callbacks — same locked-edit + ticker design as /scrape:
+    # stats_callback only touches bot_data; the 2s ticker is the ONLY thing
+    # that edits the message; milestone notices force-edit but the ticker's
+    # live text (which includes the wait phase) follows 2s later.
+    status_lock = asyncio.Lock()
     last_edit_time = {"time": 0.0}
+    ticker_task_ref = {"task": None}
     started_at = _time.time()
 
     async def _edit_status(text, force=False):
-        now = _time.time()
-        if not force and now - last_edit_time["time"] < 2.0:
-            return
-        last_edit_time["time"] = now
-        try:
-            await status_msg.edit_text(text)
-        except Exception:
-            pass
+        """Locked, rate-limit-aware edit of the status message."""
+        async with status_lock:
+            now = _time.time()
+            if not force and now - last_edit_time["time"] < 1.5:
+                return
+            last_edit_time["time"] = now
+            try:
+                await status_msg.edit_text(text)
+            except Exception as e:
+                err_str = str(e).lower()
+                if "too many requests" in err_str or "retry after" in err_str:
+                    # Back off — editing too fast; ticker will catch up
+                    last_edit_time["time"] = now + 3.0
+                # "not modified" and everything else: ignore, never fatal
+
+    # Live status ticker (shared with /scrape): renders counts PLUS the
+    # active wait phase with a ticking countdown + liveness line.
+    ticker_task_ref["task"] = asyncio.create_task(
+        _run_scrape_status_ticker(context, _edit_status, started_at)
+    )
 
     async def status_callback(text):
         context.bot_data["scrape_status"]["last_update"] = _time.time()
@@ -1762,6 +1885,7 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 drop_media_captions=strip_captions,
                 flood_break_every=cfg.flood_break_every,
                 flood_break_seconds=cfg.flood_break_seconds,
+                phase_state=phase_state,
             )
             # Update cumulative stats
             db = context.bot_data.get("db")
@@ -1808,8 +1932,18 @@ async def cmd_scrapeid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 await _edit_status(final_text, force=True)
             except Exception:
                 pass
+            # Stop the status ticker (it already did its final edit when
+            # it noticed the task finish, but cancel it defensively)
+            t = ticker_task_ref.get("task")
+            if t and not t.done():
+                t.cancel()
+                try:
+                    await t
+                except Exception:
+                    pass
             context.bot_data.pop("scrape_task", None)
             context.bot_data.pop("scrape_cancel", None)
+            context.bot_data.pop("scrape_phase", None)
 
     context.bot_data["scrape_task"] = asyncio.create_task(scrape_task())
     logger.info("ID-based scrape started for %s -> %s", parsed.chat_ref, dest_label)

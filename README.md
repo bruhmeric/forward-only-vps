@@ -125,12 +125,16 @@ DB_PATH=/app/data/forwarder.db
 # PARALLEL=5
 
 # ── Flood resilience (Telethon-first strategy) ─────────────────────
-# Telethon auto-sleeps + auto-retries EVERY FloodWait/SlowModeWait
-# whose wait is <= this threshold (seconds). Default 86400 = the max
-# Telethon allows = "absorb every flood wait silently".
-# ⚠️ Do NOT use None/0 hoping it means "wait forever" — Telethon turns
-# None into 0, which RAISES every FloodWaitError instead.
-# FLOOD_SLEEP_THRESHOLD=86400
+# Telethon auto-sleeps + auto-retries every FloodWait/SlowModeWait
+# whose wait is <= this threshold (seconds). Waits LONGER than the
+# threshold raise FloodWaitError to the bot, which shows a live
+# countdown in the status message + dashboard ("[FLOOD WAIT] 12m30s
+# remaining, resumes ~15:42") and sleeps it off before retrying.
+# Default 60 = short waits are absorbed silently, long waits become
+# VISIBLE. ⚠️ Do NOT set 86400 hoping for extra safety — it makes
+# Telethon absorb EVERY wait internally with NO status updates for up
+# to 24h (the scrape still survives, but it looks completely stuck).
+# FLOOD_SLEEP_THRESHOLD=60
 
 # Extended human-like break: pause this many seconds after every N sent
 # messages so the account-level rate budget fully recovers on long runs.
@@ -390,12 +394,13 @@ PARALLEL=8
 
 The bot uses a layered, Telethon-first strategy:
 
-1. **Telethon built-in auto-handling** — the client is created with `flood_sleep_threshold=86400` (one day, Telethon's maximum). Every FloodWait/SlowModeWait/FloodPremiumWait ≤ 24h is silently slept off and retried *inside the library*, so most floods are invisible to the bot. (⚠️ `None` is NOT "wait forever" — Telethon converts it to 0, which raises every flood instead. Use 86400.)
+1. **Telethon built-in auto-handling** — the client is created with `flood_sleep_threshold=60`: every FloodWait/SlowModeWait ≤ 60s is silently slept off and retried *inside the library*. Longer waits raise FloodWaitError to the bot, which **shows a live countdown** (status message + dashboard + `/scrape_status`), sleeps the requested time in cancel-aware chunks, and retries the same batch — so long waits are resilient AND visible. (⚠️ `None` is NOT "wait forever" — Telethon converts it to 0, which raises every flood immediately. And 86400, while survivable, makes every wait invisible for up to 24h — the bot then looks frozen during long flood waits, which is exactly the "stuck at budget recovery" symptom.)
 2. **Adaptive pacing** — an `AdaptivePacer` grows the inter-batch delay whenever a FloodWait still leaks through, and relaxes it after a streak of clean batches.
 3. **Human-like jitter** — every inter-batch delay is randomized to 75–160% of the pacer value, so the request pattern isn't metronomic.
-4. **Extended breaks** — after every 500 sent messages (configurable: `FLOOD_BREAK_EVERY` / `FLOOD_BREAK_SECONDS`), the bot pauses 5 minutes so the account-level budget fully recovers, like a human taking a break. `/stop_scrape` still works during breaks.
+4. **Extended breaks** — after every 500 sent messages (configurable: `FLOOD_BREAK_EVERY` / `FLOOD_BREAK_SECONDS`), the bot pauses 5 minutes so the account-level budget fully recovers, like a human taking a break. The status message and dashboard show a **live countdown** during the break ("[RECOVERY BREAK] 4m12s remaining"), and `/stop_scrape` works throughout.
 5. **Exponential backoff** — non-flood transient errors retry with 1s → 2s → 4s delays instead of killing the scrape.
-6. **Checkpointing (state saving)** — `last_message_id` is persisted to SQLite after **every batch**. If anything does stop the run (crash, `/stop_scrape`, reboot), re-run the same command with the `resume` flag and it continues exactly where it stopped — no duplicated sends:
+6. **Live status everywhere** — both `/scrape` and `/scrapeid` run a 2-second status ticker that shows the active wait phase (flood wait / recovery break) with a ticking countdown, plus a "Last progress: Xs ago" liveness line; the dashboard `/stats` JSON exposes `phase`, `phase_seconds_left` and `seconds_since_progress` for the same purpose. A waiting scrape is always distinguishable from a hung one.
+7. **Checkpointing (state saving)** — `last_message_id` is persisted to SQLite after **every batch**. If anything does stop the run (crash, `/stop_scrape`, reboot), re-run the same command with the `resume` flag and it continues exactly where it stopped — no duplicated sends:
    - `/scrape <url> resume` (or `/scrape <url> old resume`)
    - `/scrapeid <url> resume`
 
@@ -481,12 +486,14 @@ telegram-forwarder-vps/
 ### `/scrape` hits FloodWait on big channels
 
 This used to be a hard failure around ~1800–2000 messages. It is now handled by the layered flood strategy (see "Flood resilience" above):
-- Telethon itself auto-sleeps and auto-retries every flood wait up to 24h (`FLOOD_SLEEP_THRESHOLD=86400`) — most floods never reach the bot
+- Flood waits ≤ 60s are auto-slept inside Telethon; longer waits surface to the bot, which displays a **live countdown** in the status message and dashboard, sleeps the requested time, and retries the same batch — the scrape keeps going and you can see exactly when it will resume
 - Read pacing (getHistory) keeps safely under Telegram's ~10 req/30 s budget with headroom, with random human-like jitter
 - Send-side FloodWaits are slept off and retried — they no longer fall into the slow re-upload fallback
 - An adaptive pacer slows reads/sends after any FloodWait and speeds back up once quiet
-- Extended breaks (default 5 min per 500 msgs) let the account budget recover on huge runs
+- Extended breaks (default 5 min per 500 msgs) let the account budget recover on huge runs — shown as a live countdown, never looking like a hang
 - If a run still stops (crash, reboot, `/stop_scrape`), resume it with `/scrape <url> resume` — progress is checkpointed after every batch, so nothing is re-sent
+
+**"The bot looks stuck / nothing updates"** — if the status line shows `[FLOOD WAIT]` or `[RECOVERY BREAK]` with a countdown, the bot is *waiting by design* (Telegram asked it to slow down); it will auto-resume when the countdown hits zero, and `/stop_scrape` works the whole time. A truly hung bot would show no countdown and "Last progress" climbing without a phase line — report that case.
 
 For very large channels, `/scrapeid` is still the recommended (and much faster) path:
 

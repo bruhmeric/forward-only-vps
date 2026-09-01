@@ -174,8 +174,17 @@ async def _run_polling_with_stats(app: Application, cfg: Config) -> None:
 
         # Scrape status
         scrape_status = bot_data.get("scrape_status", {})
+        scrape_phase = bot_data.get("scrape_phase") or {}
         scrape_task = bot_data.get("scrape_task")
         scrape_running = scrape_task and not scrape_task.done()
+
+        # Live wait phase (flood wait / recovery break) — the scrape can sit
+        # inside a server-requested FloodWait for many minutes; publishing
+        # the phase + countdown lets the dashboard show "waiting, resumes
+        # at 15:42" instead of looking frozen.
+        _now = _time.time()
+        _phase_remaining = max(0.0, float(scrape_phase.get("until", 0.0)) - _now)
+        _phase_key = scrape_phase.get("key") if scrape_running else None
 
         # Custom caption
         from handlers.admin import _get_custom_caption
@@ -217,6 +226,14 @@ async def _run_polling_with_stats(app: Application, cfg: Config) -> None:
                 "started_at": scrape_status.get("started_at"),
                 "elapsed_sec": (_time.time() - scrape_status.get("started_at", 0))
                                 if scrape_status.get("started_at") else 0,
+                # Live wait phase + countdown ("flood" | "break" | null)
+                "phase": _phase_key,
+                "phase_note": scrape_phase.get("note", ""),
+                "phase_seconds_left": round(_phase_remaining, 1) if _phase_key else 0,
+                # Seconds since the last real progress update (liveness)
+                "seconds_since_progress": round(
+                    _now - scrape_status["last_update"], 1
+                ) if scrape_status.get("last_update") else None,
             },
             # All-time cumulative stats (persisted across restarts)
             "cumulative": {

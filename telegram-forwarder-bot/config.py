@@ -47,11 +47,23 @@ class Config:
     default_parallel: int = 5  # default parallel sends during /scrape (was 3)
     # --- flood resilience (Telethon-first strategy) ---
     # Telethon auto-sleeps + auto-retries any FloodWait/SlowModeWait whose
-    # requested wait is <= this threshold (in seconds). 86400 (one day) is
-    # Telethon's maximum, i.e. "absorb EVERY flood wait silently".
+    # requested wait is <= this threshold (in seconds); longer waits raise
+    # FloodWaitError to our code, which shows a live countdown in the
+    # status message + dashboard and sleeps it off before retrying.
+    #
+    # Default 60 = best of both worlds: short waits (the common case) are
+    # absorbed silently by Telethon, while LONG waits (the ones that make
+    # the bot look frozen for 15-60 min) surface to the visible handler.
+    #
+    # WARNING: raising this to 86400 makes Telethon absorb EVERY wait
+    # internally — the scrape will still never crash, but during long
+    # flood waits NOTHING updates (no status, no dashboard, /stop_scrape
+    # tier-1 is unresponsive) because our code never sees the error.
+    # That "silent waiting" is exactly what made earlier builds look
+    # "stuck at budget recovery".
     # NOTE: None/0 does NOT mean "wait forever" — Telethon's setter turns
-    # None into 0, which RAISES every FloodWaitError instead. Use 86400.
-    flood_sleep_threshold: int = 86400
+    # None into 0, which RAISES every FloodWaitError instead.
+    flood_sleep_threshold: int = 60
     # Human-like pacing: take an extended break after this many sent
     # messages (0 disables), lasting flood_break_seconds.
     flood_break_every: int = 500
@@ -98,7 +110,7 @@ class Config:
                 return default
 
         # Flood resilience knobs (see dataclass docs above)
-        flood_sleep_threshold = _env_int("FLOOD_SLEEP_THRESHOLD", 86400, 0, 24 * 60 * 60)
+        flood_sleep_threshold = _env_int("FLOOD_SLEEP_THRESHOLD", 60, 0, 24 * 60 * 60)
         flood_break_every = _env_int("FLOOD_BREAK_EVERY", 500)
         flood_break_seconds = _env_int("FLOOD_BREAK_SECONDS", 300, 0, 24 * 60 * 60)
 
