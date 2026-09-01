@@ -7,7 +7,7 @@ Run the **Telegram Forwarder Bot** + a **web dashboard** on a single VPS using D
 - Forward any media you send to a destination group/topic
 - Pull content from locked private channels via t.me links
 - Auto-scrape entire channels (`/scrape`)
-- **Bulk-forward by ID range** (`/scrapeid`) — no rate limits, works on 50k+ message channels
+- **Bulk-forward by ID range** (`/scrapeid`) — flood-adaptive pacing, works on 50k+ message channels
 - Send directly to Saved Messages (`/saved`)
 - Custom captions (`/caption`)
 - Media type filters (`/scrape <url> photo video`)
@@ -199,13 +199,13 @@ Uses `getHistory` API to read messages, then forwards them. Supports media filte
 /scrape https://t.me/c/1234567890 photo video parallel=8
 ```
 
-**⚠️ Limitation:** Fails after ~1800 messages due to getHistory rate limits (30s per 10 requests). For large channels, use `/scrapeid` instead.
+**⚠️ Rate limits:** `/scrape` reads history via `get_messages` (getHistory bucket: ~10 requests / 30 s). The bot paces reads safely under that budget with an **adaptive backoff** — if Telegram still returns a FloodWait, it sleeps it off, slows the read pace, and continues. It no longer dies at ~1800 messages, but for very large channels `/scrapeid` remains the faster option.
 
 ---
 
 ### `/scrapeid` — ID-Based Bulk Forwarding (Recommended for Large Channels)
 
-Uses `forward_messages(ids, from_peer)` which takes message IDs directly — **no getHistory needed**. Uses the SEND rate-limit bucket (different from getHistory), so it can handle 50k+ messages without rate limits.
+Uses `forward_messages(ids, from_peer)` which takes message IDs directly — **no getHistory needed**. It uses the SEND rate-limit bucket (different from getHistory) and paces batches **adaptively**: ~100 msgs per call every 3.5 s (≈28 msgs/s, under Telegram's ~30 msgs/s sustained budget), growing the delay automatically whenever a FloodWait appears and relaxing it back afterwards.
 
 **Best for:** Large public channels (1000+ messages), bulk-forwarding everything.
 
@@ -236,9 +236,9 @@ Uses `forward_messages(ids, from_peer)` which takes message IDs directly — **n
 
 **Why `/scrapeid` is faster:**
 - 100 messages per API call (vs 1 per call with getHistory)
-- Uses `forwardMessages` (send bucket, ~30/sec) instead of `getHistory` (read bucket, ~10/30s)
-- ~4000 messages/minute throughput
-- No ~1800-message FloodWait cliff
+- Uses `forwardMessages` (send bucket) instead of `getHistory` (read bucket)
+- Adaptive pacing stays under Telegram's ~30 msgs/s account budget, so sustained runs don't trigger FloodWait cliffs
+- FloodWaits (if any) are slept off and the pace backs off automatically — the scrape never dies
 
 **Limitations:**
 - Can't filter by media type (forwards everything)
@@ -362,10 +362,10 @@ PARALLEL=8
 
 ### `/scrapeid` speed
 
-`/scrapeid` is already optimized — no tuning needed:
+`/scrapeid` is tuned to run flood-free by default — no tuning needed:
 - 100 messages per API call (Telegram's max)
-- 1.5s delay between batches (safe for send limits)
-- ~4000 messages/minute throughput
+- 3.5 s adaptive delay between batches (~1,700 msgs/min sustained, under the ~30 msgs/s account budget)
+- On FloodWait: sleeps the requested time, retries the same batch, and increases the delay — never loses messages, never dies
 
 ---
 
@@ -446,9 +446,14 @@ telegram-forwarder-vps/
 - Check logs: `docker-compose logs forwarder-bot`
 - The dashboard queries internal Docker DNS (`forwarder-bot`) — this only works when both containers are on the same `bots-network`
 
-### `/scrape` fails after ~1800 messages
+### `/scrape` hits FloodWait on big channels
 
-This is a known Telegram rate limit on `getHistory` (30s per 10 requests). **Use `/scrapeid` instead** — it uses `forwardMessages` which has a different rate-limit bucket and doesn't hit this limit:
+This used to be a hard failure around ~1800–2000 messages. It is now handled:
+- Read pacing (getHistory) keeps safely under Telegram's ~10 req/30 s budget with headroom
+- Send-side FloodWaits are slept off and retried — they no longer fall into the slow re-upload fallback
+- An adaptive pacer slows reads/sends after any FloodWait and speeds back up once quiet
+
+For very large channels, `/scrapeid` is still the recommended (and much faster) path:
 
 ```
 # Instead of:
@@ -469,8 +474,8 @@ The 3-tier force-stop should always work. If it doesn't:
 ### Scrape is slow
 
 - For `/scrape`: Increase `PARALLEL` in `.env` (default: 5, max: 10)
-- For large channels: Use `/scrapeid` instead (much faster, no rate limits)
-- If you hit FloodWait often, lower the parallel count
+- For large channels: Use `/scrapeid` instead (much faster, flood-adaptive)
+- If you hit FloodWait often, lower the parallel count — the bot also backs off automatically now
 
 ### Firewall
 

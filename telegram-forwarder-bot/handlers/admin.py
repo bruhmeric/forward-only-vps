@@ -113,7 +113,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/test_link <url>  — diagnostic: test fetching a t.me link\n"
         "/saved <url>    — 🚀 FAST: send t.me link content to Saved Messages\n"
         "/scrape <url> [flags]  — 🤖 AUTO: scrape ALL media from a channel\n"
-        "/scrapeid <url> [start] [end] [saved] [keep]  — 🚀 FAST: forward by ID (no rate limits)\n"
+        "/scrapeid <url> [start] [end] [saved] [keep]  — 🚀 FAST: forward by ID (flood-adaptive)\n"
         "/stop_scrape    — 🛑 stop the active scrape\n"
         "/scrape_status  — 📊 check scrape progress\n"
         "/caption <text>  — 📝 set a custom caption (replaces original)\n"

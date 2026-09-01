@@ -11,6 +11,7 @@ prompt interactively.
 """
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import os
@@ -20,7 +21,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from telethon import TelegramClient
-from telethon.errors import ChannelPrivateError, InviteHashInvalidError
+from telethon.errors import ChannelPrivateError, FloodWaitError, InviteHashInvalidError
 from telethon.tl import types as tl
 from telethon.tl.functions.messages import GetForumTopicsRequest
 
@@ -112,6 +113,97 @@ def parse_channel_link(url: str) -> Optional[ParsedLink]:
         return ParsedLink(kind="public", chat_ref=username, message_id=0)
 
     return None
+
+
+# ---------- flood-wait / rate-limit helpers ----------
+
+async def _sleep_chunks(seconds: float, cancel_event=None, chunk: float = 1.0) -> bool:
+    """Sleep for `seconds` in small, cancellable chunks.
+
+    Returns True if the full delay elapsed, False if `cancel_event` was set
+    mid-sleep (task cancellation still raises CancelledError as usual).
+
+    Used everywhere instead of raw `asyncio.sleep` for long waits (FloodWait
+    sleeps, inter-batch delays) so `/stop_scrape` stays responsive even
+    during multi-minute server-requested waits. Unlike the ad-hoc loops it
+    replaced, it also supports fractional delays.
+    """
+    end = time.monotonic() + max(0.0, seconds)
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            return False
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            return True
+        await asyncio.sleep(min(chunk, remaining))
+
+
+class AdaptivePacer:
+    """Inter-request delay that backs off when Telegram complains.
+
+    The scrapes used fixed delays chosen exactly at (or above) Telegram's
+    rate budgets, so big channels always hit FloodWait at the same point
+    (~2000 messages) and then re-offended at the same pace after every
+    sleep — escalating waits until the retry budget ran out. The pacer
+    instead *grows* the delay multiplicatively whenever a FloodWait is
+    seen and slowly relaxes it back towards the base after a streak of
+    quiet batches, converging on the fastest flood-free pace.
+    """
+
+    def __init__(self, base: float, maximum: float = 15.0, factor: float = 1.5,
+                 recover_after: int = 8):
+        self.base = base
+        self.maximum = maximum
+        self.factor = factor
+        self.recover_after = recover_after
+        self.current = base
+        self._clean_streak = 0
+
+    def on_flood(self, seconds: float = 0) -> float:
+        """Grow the delay after a FloodWait. Returns the new delay."""
+        # Grow at least 1.5x; also honour (a fraction of) the server's own
+        # requested wait so repeated violations quickly become unlikely.
+        target = self.current * self.factor + 0.5
+        if seconds and seconds > 0:
+            target = max(target, min(seconds, self.maximum) / 3.0)
+        self.current = min(target, self.maximum)
+        self._clean_streak = 0
+        return self.current
+
+    def on_success(self) -> None:
+        """Count a clean batch; gently recover towards the base pace."""
+        self._clean_streak += 1
+        if self._clean_streak >= self.recover_after:
+            self.current = max(self.base, self.current * 0.9)
+            self._clean_streak = 0
+
+
+_FORWARD_SUPPORTS_DROP_MEDIA_CAPTIONS: Optional[bool] = None
+
+
+def _forward_kwargs(drop_author: bool, drop_media_captions: bool) -> dict:
+    """Build kwargs for TelegramClient.forward_messages.
+
+    `drop_media_captions` only exists on Telethon >= 1.40 — passing it to
+    older versions raises TypeError on every call. Detect support once and
+    degrade gracefully (with a logged warning) instead of crashing.
+    """
+    global _FORWARD_SUPPORTS_DROP_MEDIA_CAPTIONS
+    if _FORWARD_SUPPORTS_DROP_MEDIA_CAPTIONS is None:
+        try:
+            params = inspect.signature(TelegramClient.forward_messages).parameters
+            _FORWARD_SUPPORTS_DROP_MEDIA_CAPTIONS = "drop_media_captions" in params
+        except (TypeError, ValueError):
+            _FORWARD_SUPPORTS_DROP_MEDIA_CAPTIONS = False
+    kwargs: dict = {"drop_author": drop_author}
+    if _FORWARD_SUPPORTS_DROP_MEDIA_CAPTIONS:
+        kwargs["drop_media_captions"] = drop_media_captions
+    elif drop_media_captions:
+        logger.warning(
+            "Installed Telethon does not support drop_media_captions "
+            "(needs >= 1.40) — captions will be kept. Upgrade Telethon."
+        )
+    return kwargs
 
 
 # ---------- session manager ----------
@@ -692,31 +784,50 @@ class UserSession:
         # Skip this step if a custom_caption is set — forward_messages doesn't
         # let us override the caption, so we need to use the send_message path
         # (which DOES let us set the caption) for caption control.
-        if custom_caption is None:
-            try:
-                # Build reply_to for topics if specified
-                kwargs: dict = {}
-                if topic_id:
-                    from telethon.tl.types import MessageReplyHeader
-                    kwargs["reply_to"] = MessageReplyHeader(
-                        reply_to_top_id=topic_id,
-                        reply_to_msg_id=topic_id,
+        # Also skip when sending into a forum TOPIC: forward_messages has no
+        # reply_to/top_msg_id parameter, so a true forward would land in the
+        # group's GENERAL chat instead of the requested topic (the old code
+        # built a reply_to kwarg for it but never passed it — dead code that
+        # silently sent topic scrapes to the wrong place).
+        if custom_caption is None and not topic_id:
+            # CRITICAL: a FloodWaitError here is NOT a "forward not allowed"
+            # error. The old code caught it with a generic `except Exception`
+            # and fell into the copy-and-re-upload fallback, which issues FAR
+            # more API calls (one send_message per item, or a full download
+            # + re-upload) and escalates the flood into a death spiral on big
+            # scrapes. Now we sleep it off and retry the forward; only a
+            # *persistent* flood is re-raised so the caller's own flood
+            # handling (scrape's _send_one) can take over.
+            forward_flood_tries = 0
+            while True:
+                try:
+                    await self.client.forward_messages(
+                        dest_entity,
+                        [m.id for m in messages],
+                        source_entity,
                     )
-
-                await self.client.forward_messages(
-                    dest_entity,
-                    [m.id for m in messages],
-                    source_entity,
-                )
-                diag.append(f"✓ True forward succeeded — {len(messages)} message(s) "
-                            f"forwarded to destination"
-                            f"{f' (topic {topic_id})' if topic_id else ''}")
-                return True, diag
-            except Exception as forward_err:
-                diag.append(f"⚠ True forward failed: {type(forward_err).__name__}: {forward_err}")
-                diag.append("  → Falling back to copy-and-resend (for protected content)")
+                    diag.append(f"✓ True forward succeeded — {len(messages)} message(s) "
+                                f"forwarded to destination")
+                    return True, diag
+                except FloodWaitError as fw_err:
+                    forward_flood_tries += 1
+                    if forward_flood_tries > 2:
+                        raise  # persistent flood — let the caller handle it
+                    diag.append(
+                        f"⏳ FloodWait {fw_err.seconds}s on true forward — sleeping and "
+                        f"retrying ({forward_flood_tries}/2); NOT falling back to re-upload"
+                    )
+                    await _sleep_chunks(float(fw_err.seconds) + 2)
+                except Exception as forward_err:
+                    diag.append(f"⚠ True forward failed: {type(forward_err).__name__}: {forward_err}")
+                    diag.append("  → Falling back to copy-and-resend (for protected content)")
+                    break
         else:
-            diag.append("ℹ Skipping true forward (custom_caption is set — using send_message)")
+            if custom_caption is not None:
+                diag.append("ℹ Skipping true forward (custom_caption is set — using send_message)")
+            else:
+                diag.append("ℹ Skipping true forward (topic destination — "
+                            "forward_messages cannot target a forum topic)")
 
         # ---- Step 2: fallback — re-upload via send_message(file=msg.media) ----
         # This bypasses the noforwards restriction by re-uploading from
@@ -803,10 +914,33 @@ class UserSession:
                 if i > 0 and custom_caption is None:
                     send_kwargs["message"] = ""
 
-                await self.client.send_message(dest_entity, **send_kwargs)
-                sent_count += 1
-                diag.append(f"✓ Re-sent message {i+1}/{len(messages)} "
-                            f"(type: {type(msg.media).__name__ if msg.media else 'text'})")
+                # Flood-aware send: sleep + retry instead of instantly
+                # marking the message failed. The old behaviour counted the
+                # message as failed while the loop kept hammering the API
+                # with the remaining messages — escalating the flood.
+                send_flood_tries = 0
+                while True:
+                    try:
+                        await self.client.send_message(dest_entity, **send_kwargs)
+                        sent_count += 1
+                        diag.append(f"✓ Re-sent message {i+1}/{len(messages)} "
+                                    f"(type: {type(msg.media).__name__ if msg.media else 'text'})")
+                        break
+                    except FloodWaitError as fw_err:
+                        send_flood_tries += 1
+                        if send_flood_tries > 2:
+                            raise  # persistent — outer handler re-raises to caller
+                        diag.append(
+                            f"⏳ FloodWait {fw_err.seconds}s on send_message — sleeping and "
+                            f"retrying ({send_flood_tries}/2)"
+                        )
+                        await _sleep_chunks(float(fw_err.seconds) + 2)
+            except FloodWaitError:
+                # Persistent flood — abort the whole send so the caller can
+                # apply its own backoff. Falling through to Step 3 (full
+                # download + re-upload) would only multiply API calls and
+                # make the flood worse.
+                raise
             except Exception as e:
                 last_error = e
                 diag.append(f"✗ Failed to send message {i+1}/{len(messages)} "
@@ -1657,12 +1791,9 @@ class UserSession:
                         f"   Sent so far: {result['sent_count']}"
                     )
                 # Sleep in chunks so we can be interrupted by cancel
-                end_wait = _time.time() + wait_seconds
-                while _time.time() < end_wait:
-                    if cancel_event and cancel_event.is_set():
-                        result["failed_count"] += 1
-                        return False
-                    await _asyncio.sleep(min(5, end_wait - _time.time()))
+                if not await _sleep_chunks(wait_seconds, cancel_event):
+                    result["failed_count"] += 1
+                    return False
                 # Retry once
                 try:
                     success, _ = await _asyncio.wait_for(
@@ -1743,7 +1874,16 @@ class UserSession:
         # offset_id is a pagination cursor (exclusive): "messages older than this ID"
         # We advance it to the OLDEST id in each batch (messages come newest→oldest)
         BATCH_SIZE = 100
-        BATCH_DELAY = 3  # seconds between batches (≥3 to respect Telegram's budget)
+        # Telegram's getHistory budget is roughly 10 requests per 30 s
+        # (≈3 s per request). The old BATCH_DELAY=3 sat EXACTLY on that
+        # budget with zero headroom, so scrapes of big channels started
+        # flooding at ~1800-2000 messages (≈20 getHistory calls) and then
+        # re-offended at the same pace after every sleep. 3.5 s keeps us
+        # safely under the budget; the AdaptivePacer grows the delay
+        # further whenever Telegram still complains and relaxes it back
+        # after a streak of quiet batches.
+        BATCH_DELAY = 3.5
+        read_pacer = AdaptivePacer(base=BATCH_DELAY, maximum=15.0)
         MAX_FLOOD_RETRIES = 10
 
         # For reverse=True (oldest first), we need a different approach:
@@ -1788,18 +1928,16 @@ class UserSession:
                 except FloodWaitError as e:
                     result["flood_waits"] += 1
                     wait_seconds = e.seconds + 2
+                    new_pace = read_pacer.on_flood(e.seconds)
                     if status_callback:
                         await status_callback(
                             f"⏳ Flood wait on get_messages: sleeping {wait_seconds}s "
                             f"(attempt {attempt+1}/{MAX_FLOOD_RETRIES})...\n"
-                            f"   Sent so far: {result['sent_count']}, Seen: {result['total_seen']}"
+                            f"   Sent so far: {result['sent_count']}, Seen: {result['total_seen']}\n"
+                            f"   Read pace auto-adjusted to {new_pace:.1f}s/batch"
                         )
                     # Sleep in chunks so we can be interrupted by cancel
-                    end_wait = _time.time() + wait_seconds
-                    while _time.time() < end_wait:
-                        if cancel_event and cancel_event.is_set():
-                            break
-                        await _asyncio.sleep(min(5, end_wait - _time.time()))
+                    await _sleep_chunks(wait_seconds, cancel_event)
                     if cancel_event and cancel_event.is_set():
                         break
                     # Retry the same batch (offset_id unchanged)
@@ -1960,13 +2098,15 @@ class UserSession:
                 result["cancelled"] = True
                 break
 
-            # Sleep between batches to respect Telegram's rate limit
-            # Sleep in 1-second chunks so we can be interrupted by cancel
-            for _ in range(BATCH_DELAY):
-                if cancel_event and cancel_event.is_set():
-                    result["cancelled"] = True
-                    break
-                await _asyncio.sleep(1)
+            # Sleep between batches to respect Telegram's rate limit.
+            # The batch fetched cleanly — count it towards pace recovery,
+            # then sleep the (adaptive) inter-batch delay. _sleep_chunks is
+            # float-safe and cancel-aware; the old `range(BATCH_DELAY)` loop
+            # only supported whole seconds and ignored pacing changes.
+            read_pacer.on_success()
+            if not await _sleep_chunks(read_pacer.current, cancel_event):
+                result["cancelled"] = True
+                break
 
         # Wait for any remaining in-flight send tasks to complete
         if pending_send_tasks:
@@ -2009,7 +2149,7 @@ class UserSession:
         drop_author: bool = True,
         drop_media_captions: bool = False,
         batch_size: int = 100,
-        batch_delay: float = 1.5,
+        batch_delay: float = 3.5,
     ) -> dict:
         """Forward messages from a public channel by ID range — NO getHistory.
 
@@ -2018,7 +2158,8 @@ class UserSession:
           directly — no need to read messages via getHistory first
         - Uses the SEND rate-limit bucket (not the getHistory bucket)
         - 100 messages per API call (Telegram's max per forwardMessages)
-        - Completely avoids the ~1800-message FloodWait cliff
+        - Avoids the getHistory FloodWait cliff entirely; send-side
+          FloodWaits are slept off and the pace adapts automatically
 
         Args:
           source_chat_ref: chat_id (int) or username (str) of the source channel
@@ -2031,7 +2172,10 @@ class UserSession:
           drop_author: if True, strips "Forwarded from" header
           drop_media_captions: if True, strips ALL captions from media
           batch_size: messages per forwardMessages call (max 100)
-          batch_delay: seconds between batches (1.5s is safe for send limits)
+          batch_delay: base seconds between batches. 3.5 s ≈ 28.5 msgs/s,
+            safely under Telegram's ~30 msgs/s sustained account budget
+            (the old 1.5 s ≈ 66 msgs/s is what triggered FloodWait around
+            ~2000 messages on big channels). Grows automatically on FloodWait.
 
         Returns:
           dict with sent_count, failed_count, total_seen, last_message_id, etc.
@@ -2100,13 +2244,100 @@ class UserSession:
             await status_callback(
                 f"🚀 Starting ID-based forward: {source_chat_ref} → {dest_chat_id}\n"
                 f"   IDs {start_id} to {end_id} ({end_id - start_id + 1} messages)\n"
-                f"   Batch: {batch_size} msgs/call, delay: {batch_delay}s\n"
+                f"   Batch: {batch_size} msgs/call, delay: {batch_delay:.1f}s (adaptive)\n"
                 f"   drop_author: {drop_author}"
             )
 
         last_status_time = 0
         status_interval = 2.0
         MAX_FLOOD_RETRIES = 10
+
+        # Adaptive send pacer: 100 messages per forwardMessages call at the
+        # old 1.5 s pace ≈ 66 msgs/s — over Telegram's ~30 msgs/s sustained
+        # account budget, which is why big /scrapeid runs hit FloodWait at
+        # ~2000 messages. 3.5 s/batch ≈ 28.5 msgs/s stays under it; the pacer
+        # backs off further whenever Telegram complains and slowly recovers
+        # afterwards, converging on the fastest flood-free pace.
+        send_pacer = AdaptivePacer(base=batch_delay, maximum=20.0)
+
+        # Build forward kwargs once — drop_media_captions needs Telethon
+        # >= 1.40 (detect support instead of crashing with TypeError).
+        fw_kwargs = _forward_kwargs(drop_author, drop_media_captions)
+
+        async def _forward_ids(ids: list) -> None:
+            """Forward one slice of IDs with FloodWait-aware retry.
+
+            Handles deleted-ID ranges by bisecting: a MessageIdInvalidError
+            on a multi-ID slice means SOME ids in it are deleted, so we split
+            and recurse into both halves. FloodWaits sleep (cancel-aware)
+            and retry the SAME slice — the old code slept but then dropped
+            the half entirely, silently losing messages. Sets
+            result['failed_count'] = -1 to signal a fatal abort.
+            """
+            for attempt in range(MAX_FLOOD_RETRIES):
+                if cancel_event and cancel_event.is_set():
+                    result["cancelled"] = True
+                    return
+                try:
+                    await self.client.forward_messages(
+                        dest_entity, ids, from_peer=source_entity, **fw_kwargs,
+                    )
+                    result["sent_count"] += len(ids)
+                    if ids and ids[-1] > result["last_message_id"]:
+                        result["last_message_id"] = ids[-1]
+                    send_pacer.on_success()
+                    return
+                except MessageIdInvalidError:
+                    if len(ids) <= 1:
+                        # A single deleted message ID — count and move on
+                        result["failed_count"] += 1
+                        return
+                    mid = len(ids) // 2
+                    await _forward_ids(ids[:mid])
+                    if result["cancelled"] or result["failed_count"] == -1:
+                        return
+                    # Pace between the bisection halves as well
+                    if not await _sleep_chunks(send_pacer.current / 2, cancel_event):
+                        result["cancelled"] = True
+                        return
+                    await _forward_ids(ids[mid:])
+                    return
+                except FloodWaitError as e:
+                    result["flood_waits"] += 1
+                    wait = e.seconds + 2
+                    new_pace = send_pacer.on_flood(e.seconds)
+                    if status_callback:
+                        await status_callback(
+                            f"⏳ FloodWait: sleeping {wait}s "
+                            f"(attempt {attempt+1}/{MAX_FLOOD_RETRIES})...\n"
+                            f"   Sent so far: {result['sent_count']}\n"
+                            f"   Batch delay auto-adjusted to {new_pace:.1f}s"
+                        )
+                    await _sleep_chunks(wait, cancel_event)
+                    continue  # retry the same slice
+                except ConnectionError:
+                    logger.warning("connection dropped during forward — reconnecting")
+                    if status_callback:
+                        await status_callback("⚠️ Connection dropped. Reconnecting...")
+                    await _asyncio.sleep(2)
+                    if not await self._ensure_connected():
+                        result["failed_count"] = -1
+                        return
+                    continue
+                except _asyncio.CancelledError:
+                    result["cancelled"] = True
+                    return
+                except Exception as e:
+                    logger.warning("forward batch failed: %s", e)
+                    result["failed_count"] += len(ids)
+                    return
+            # Exhausted flood retries for this slice — fatal abort
+            if status_callback:
+                await status_callback(
+                    f"❌ Exhausted {MAX_FLOOD_RETRIES} flood retries on IDs "
+                    f"{ids[0] if ids else '?'}+ — stopping."
+                )
+            result["failed_count"] = -1
 
         # Iterate ID ranges in batches
         current_id = start_id
@@ -2128,116 +2359,14 @@ class UserSession:
             msg_ids = list(range(current_id, batch_end + 1))
             result["total_seen"] += len(msg_ids)
 
-            # Forward this batch with FloodWait retry
-            for attempt in range(MAX_FLOOD_RETRIES):
-                if cancel_event and cancel_event.is_set():
-                    break
-                try:
-                    await self.client.forward_messages(
-                        dest_entity,
-                        msg_ids,
-                        from_peer=source_entity,
-                        drop_author=drop_author,
-                        drop_media_captions=drop_media_captions,
-                    )
-                    result["sent_count"] += len(msg_ids)
-                    result["last_message_id"] = batch_end
-                    break
-                except MessageIdInvalidError:
-                    # Some IDs in this range don't exist (deleted messages).
-                    # Bisect: try first half, then second half.
-                    if len(msg_ids) <= 1:
-                        result["failed_count"] += 1
-                        break
-                    mid = len(msg_ids) // 2
-                    for half in (msg_ids[:mid], msg_ids[mid:]):
-                        if cancel_event and cancel_event.is_set():
-                            break
-                        try:
-                            await self.client.forward_messages(
-                                dest_entity, half, from_peer=source_entity,
-                                drop_author=drop_author,
-                                drop_media_captions=drop_media_captions,
-                            )
-                            result["sent_count"] += len(half)
-                            result["last_message_id"] = half[-1]
-                        except MessageIdInvalidError:
-                            if len(half) <= 1:
-                                result["failed_count"] += 1
-                            else:
-                                # Recursive bisection (simplified — just split once more)
-                                sub_mid = len(half) // 2
-                                for sub_half in (half[:sub_mid], half[sub_mid:]):
-                                    try:
-                                        await self.client.forward_messages(
-                                            dest_entity, sub_half, from_peer=source_entity,
-                                            drop_author=drop_author,
-                                            drop_media_captions=drop_media_captions,
-                                        )
-                                        result["sent_count"] += len(sub_half)
-                                        result["last_message_id"] = sub_half[-1]
-                                    except Exception:
-                                        result["failed_count"] += len(sub_half)
-                        except FloodWaitError as e:
-                            result["flood_waits"] += 1
-                            wait = e.seconds + 2
-                            if status_callback:
-                                await status_callback(
-                                    f"⏳ FloodWait {wait}s on forward (bisect, attempt {attempt+1})"
-                                )
-                            end_wait = _time.time() + wait
-                            while _time.time() < end_wait:
-                                if cancel_event and cancel_event.is_set():
-                                    break
-                                await _asyncio.sleep(min(5, end_wait - _time.time()))
-                        except Exception as e:
-                            logger.warning("forward batch (bisect) failed: %s", e)
-                            result["failed_count"] += len(half)
-                    break  # done with bisection
-                except FloodWaitError as e:
-                    result["flood_waits"] += 1
-                    wait = e.seconds + 2
-                    if status_callback:
-                        await status_callback(
-                            f"⏳ FloodWait: sleeping {wait}s "
-                            f"(attempt {attempt+1}/{MAX_FLOOD_RETRIES})...\n"
-                            f"   Sent so far: {result['sent_count']}"
-                        )
-                    end_wait = _time.time() + wait
-                    while _time.time() < end_wait:
-                        if cancel_event and cancel_event.is_set():
-                            break
-                        await _asyncio.sleep(min(5, end_wait - _time.time()))
-                    if cancel_event and cancel_event.is_set():
-                        break
-                    continue  # retry same batch
-                except ConnectionError as e:
-                    logger.warning("connection dropped during forward: %s", e)
-                    if status_callback:
-                        await status_callback("⚠️ Connection dropped. Reconnecting...")
-                    await _asyncio.sleep(2)
-                    if not await self._ensure_connected():
-                        result["failed_count"] = -1
-                        return result
-                    continue
-                except _asyncio.CancelledError:
-                    result["cancelled"] = True
-                    break
-                except Exception as e:
-                    logger.warning("forward batch failed: %s", e)
-                    result["failed_count"] += len(msg_ids)
-                    break
-            else:
-                # Exhausted retries
-                if status_callback:
-                    await status_callback(
-                        f"❌ Exhausted {MAX_FLOOD_RETRIES} flood retries. Stopping."
-                    )
-                result["failed_count"] = -1
-                return result
+            # Forward this batch (FloodWait-aware; bisects around deleted IDs)
+            await _forward_ids(msg_ids)
 
             if result["cancelled"]:
                 break
+            if result["failed_count"] == -1:
+                # _forward_ids exhausted flood retries or lost the connection
+                return result
 
             # Stats callback
             if stats_callback:
@@ -2261,18 +2390,21 @@ class UserSession:
                     f"Flood waits: {result['flood_waits']}\n"
                     f"Progress: {pct:.1f}%\n"
                     f"Speed: {throughput:.0f} items/min\n"
+                    f"Batch delay: {send_pacer.current:.1f}s (adaptive)\n"
                     f"Elapsed: {elapsed:.0f}s"
                 )
 
             current_id = batch_end + 1
 
-            # Delay between batches (in 1s chunks for cancellation)
+            # Adaptive inter-batch delay. NOTE: the old code used
+            # `range(int(batch_delay))`, which silently TRUNCATED fractional
+            # delays (the documented 1.5 s actually slept only 1 s — even
+            # faster than intended). _sleep_chunks is float-safe, honours the
+            # pacer, and stays cancellable.
             if current_id <= end_id:
-                for _ in range(int(batch_delay)):
-                    if cancel_event and cancel_event.is_set():
-                        result["cancelled"] = True
-                        break
-                    await _asyncio.sleep(1)
+                if not await _sleep_chunks(send_pacer.current, cancel_event):
+                    result["cancelled"] = True
+                    break
 
         # Final status
         if status_callback:
