@@ -38,7 +38,16 @@ from typing import Optional
 # forward_messages' drop_media_captions only handles media), and drop
 # the "Forwarded from" header (a fresh send has none). Slower than
 # plain /scrapeid but produces clean output.
-CODE_VERSION = "v8"
+#
+# v9: dashboard diagnostic overhaul — /api/diag endpoint, connection
+# diagnostic banner with EXACT error (timeout / connection refused /
+# DNS failure), "Checking..." watchdog that fires after 15s, fetch_json
+# now logs every outcome and recreates the session on error. The bot
+# itself is unchanged in v9 — only the dashboard changed. But the
+# version must still be bumped so the dashboard knows the user has
+# rebuilt the bot image (the dashboard's EXPECTED_BOT_BUILD compares
+# against this).
+CODE_VERSION = "v9"
 
 try:
     from dotenv import load_dotenv
